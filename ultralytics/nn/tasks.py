@@ -28,6 +28,7 @@ from ultralytics.nn.modules import (
     A2C2f,
     AConv,
     ADown,
+    BDFUpsample,
     Bottleneck,
     BottleneckCSP,
     C2f,
@@ -48,6 +49,8 @@ from ultralytics.nn.modules import (
     DWConv,
     DWConvTranspose2d,
     Focus,
+    GaborLLDHigh,
+    GaborLLDLow,
     GhostBottleneck,
     GhostConv,
     HGBlock,
@@ -55,6 +58,7 @@ from ultralytics.nn.modules import (
     ImagePoolingAttn,
     Index,
     LRPCHead,
+    MambaCM,
     Pose,
     Pose26,
     RepC3,
@@ -64,6 +68,7 @@ from ultralytics.nn.modules import (
     ResNetLayer,
     RTDETRDecoder,
     SCDown,
+    SGF,
     Segment,
     Segment26,
     TorchVision,
@@ -1621,7 +1626,31 @@ def parse_model(d, ch, verbose=True):
                 with contextlib.suppress(ValueError):
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
         n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
-        if m in base_modules:
+        # ----- custom modules (GaborLLD*, MambaCM, BDFUpsample, SGF) channel injection -----
+        if m in {GaborLLDLow, GaborLLDHigh, MambaCM}:
+            f0 = f[0] if isinstance(f, (list, tuple)) else f
+            c1 = ch[f0]
+            args = [c1, *args]
+            if m is GaborLLDHigh:
+                # args after prepend: [c1, k, r, cg, n_orient, n_scales, magnitude]
+                c2 = args[3]
+            else:
+                c2 = c1
+        elif m is BDFUpsample:
+            # multi-input: (feat_deep, guide_high, guide_low); output ch equals deep branch
+            c_deep = ch[f[0]]
+            c_high = ch[f[1]]
+            c_low = ch[f[2]]
+            args = [c_deep, c_high, c_low, *args]
+            c2 = c_deep
+        elif m is SGF:
+            # multi-input fusion; c_out provided as first arg, prepend incoming channels
+            c_m = ch[f[0]]
+            c_b = ch[f[1]]
+            c_low = ch[f[2]]
+            args = [c_m, c_b, c_low, *args]
+            c2 = args[3]
+        elif m in base_modules:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 != nc (e.g., Classify() output)
                 c2 = make_divisible(min(c2, max_channels) * width, 8)
@@ -1651,6 +1680,12 @@ def parse_model(d, ch, verbose=True):
             if m is HGBlock:
                 args.insert(4, n)  # number of repeats
                 n = 1
+        elif m is BDFUpsample:
+            # multi-input: (feat_deep, guide_high, guide_low); output ch equals deep branch
+            c2 = ch[f[0]]
+        elif m is SGF:
+            # multi-input fusion; c_out provided as first arg
+            c2 = args[0]
         elif m is ResNetLayer:
             c2 = args[1] if args[3] else args[1] * 4
         elif m is torch.nn.BatchNorm2d:
