@@ -93,6 +93,7 @@ from .head import (
     YOLOESegment26,
     v10Detect,
 )
+from .freqfusion import FreqFusion, FreqFusionCat
 from .transformer import (
     AIFI,
     MLP,
@@ -187,4 +188,6 @@ __all__ = (
     "YOLOESegment",
     "YOLOESegment26",
     "v10Detect",
+    "FreqFusion",
+    "FreqFusionCat",
 )

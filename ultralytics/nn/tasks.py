@@ -72,6 +72,7 @@ from ultralytics.nn.modules import (
     YOLOESegment,
     YOLOESegment26,
     v10Detect,
+    FreqFusionCat,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -1657,6 +1658,11 @@ def parse_model(d, ch, verbose=True):
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
+        elif m is FreqFusionCat:
+            lr_idx, hr_idx = f
+            hr_ch, lr_ch = ch[hr_idx], ch[lr_idx]
+            args = [hr_ch, lr_ch, *args]
+            c2 = hr_ch + lr_ch
         elif m in frozenset(
             {
                 Detect,
