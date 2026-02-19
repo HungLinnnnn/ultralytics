@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from ultralytics.models.yolo.detect import DetectionValidator
 from ultralytics.utils import LOGGER, ops
 from ultralytics.utils.checks import check_requirements
-from ultralytics.utils.metrics import SegmentMetrics, mask_iou
+from ultralytics.utils.metrics import SegmentMetrics, mask_iou, compute_aji, compute_dice, compute_pq
 
 
 class SegmentationValidator(DetectionValidator):
@@ -76,7 +76,7 @@ class SegmentationValidator(DetectionValidator):
 
     def get_desc(self) -> str:
         """Return a formatted description of evaluation metrics."""
-        return ("%22s" + "%11s" * 10) % (
+        return ("%22s" + "%11s" * 13) % (
             "Class",
             "Images",
             "Instances",
@@ -88,6 +88,9 @@ class SegmentationValidator(DetectionValidator):
             "R",
             "mAP50",
             "mAP50-95)",
+            "PQ",
+            "AJI",
+            "Dice",
         )
 
     def postprocess(self, preds: list[torch.Tensor]) -> list[dict[str, torch.Tensor]]:
@@ -164,10 +167,46 @@ class SegmentationValidator(DetectionValidator):
         gt_cls = batch["cls"]
         if gt_cls.shape[0] == 0 or preds["cls"].shape[0] == 0:
             tp_m = np.zeros((preds["cls"].shape[0], self.niou), dtype=bool)
+            pq = np.array([0.0])
+            aji = np.array([0.0])
+            dice = np.array([0.0])
         else:
             iou = mask_iou(batch["masks"].flatten(1), preds["masks"].flatten(1).float())  # float, uint8
             tp_m = self.match_predictions(preds["cls"], gt_cls, iou).cpu().numpy()
-        tp.update({"tp_m": tp_m})  # update tp with mask IoU
+            # PQ/AJI/Dice
+            gt_masks = batch["masks"].flatten(1).bool()
+            pred_masks = preds["masks"].flatten(1).float().gt_(0.5)
+            iou_np = iou.cpu().numpy()
+            matches = np.argwhere(iou_np >= 0.5)
+            if matches.shape[0]:
+                matches = matches[np.argsort(iou_np[matches[:, 0], matches[:, 1]])[::-1]]
+                used_g, used_p, kept = set(), set(), []
+                for g, p in matches:
+                    if g not in used_g and p not in used_p:
+                        used_g.add(int(g))
+                        used_p.add(int(p))
+                        kept.append((int(g), int(p)))
+                tp_cnt = len(kept)
+                fp_cnt = pred_masks.shape[0] - tp_cnt
+                fn_cnt = gt_masks.shape[0] - tp_cnt
+                iou_sum = float(sum(iou_np[g, p] for g, p in kept))
+            else:
+                kept = []
+                tp_cnt = 0
+                fp_cnt = pred_masks.shape[0]
+                fn_cnt = gt_masks.shape[0]
+                iou_sum = 0.0
+
+            pq = np.array([compute_pq(tp_cnt, fp_cnt, fn_cnt, iou_sum)], dtype=float)
+
+            gt_np = gt_masks.cpu().numpy()
+            pred_np = pred_masks.cpu().numpy()
+            aji = np.array([compute_aji(gt_np, pred_np, kept)], dtype=float)
+
+            gt_union = gt_np.any(axis=0)
+            pred_union = pred_np.any(axis=0)
+            dice = np.array([compute_dice(gt_union, pred_union)], dtype=float)
+        tp.update({"tp_m": tp_m, "pq": pq, "aji": aji, "dice": dice})  # update tp with mask IoU and extra metrics
         return tp
 
     def plot_predictions(self, batch: dict[str, Any], preds: list[dict[str, torch.Tensor]], ni: int) -> None:

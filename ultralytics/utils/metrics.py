@@ -165,6 +165,45 @@ def mask_iou(mask1: torch.Tensor, mask2: torch.Tensor, eps: float = 1e-7) -> tor
     return intersection / (union + eps)
 
 
+def compute_pq(tp: int, fp: int, fn: int, iou_sum: float, eps: float = 1e-7) -> float:
+    """Panoptic Quality."""
+    denom = tp + 0.5 * fp + 0.5 * fn
+    return float(iou_sum / (denom + eps)) if denom > 0 else 0.0
+
+
+def compute_aji(gt_masks: np.ndarray, pred_masks: np.ndarray, matches: list[tuple[int, int]]) -> float:
+    """Aggregated Jaccard Index (AJI)."""
+    if gt_masks.size == 0 and pred_masks.size == 0:
+        return 1.0
+    gt_area = gt_masks.sum(axis=1)
+    pred_area = pred_masks.sum(axis=1)
+    matched_gt, matched_pred = set(), set()
+    inter_sum = 0.0
+    union_sum = 0.0
+    for g, p in matches:
+        inter = np.logical_and(gt_masks[g], pred_masks[p]).sum()
+        union = gt_area[g] + pred_area[p] - inter
+        inter_sum += inter
+        union_sum += union
+        matched_gt.add(g)
+        matched_pred.add(p)
+    # unmatched
+    if len(gt_area):
+        union_sum += gt_area[[i for i in range(len(gt_area)) if i not in matched_gt]].sum()
+    if len(pred_area):
+        union_sum += pred_area[[i for i in range(len(pred_area)) if i not in matched_pred]].sum()
+    return float(inter_sum / union_sum) if union_sum > 0 else 0.0
+
+
+def compute_dice(gt_union: np.ndarray, pred_union: np.ndarray, eps: float = 1e-7) -> float:
+    """Dice over union of all masks."""
+    inter = np.logical_and(gt_union, pred_union).sum()
+    denom = gt_union.sum() + pred_union.sum()
+    if denom == 0:
+        return 1.0
+    return float(2.0 * inter / (denom + eps))
+
+
 def kpt_iou(
     kpt1: torch.Tensor, kpt2: torch.Tensor, area: torch.Tensor, sigma: list[float], eps: float = 1e-7
 ) -> torch.Tensor:
@@ -1211,7 +1250,11 @@ class SegmentMetrics(DetMetrics):
         DetMetrics.__init__(self, names)
         self.seg = Metric()
         self.task = "segment"
-        self.stats["tp_m"] = []  # add additional stats for masks
+        # additional stats
+        self.stats.update({"tp_m": [], "pq": [], "aji": [], "dice": []})
+        self.pq = 0.0
+        self.aji = 0.0
+        self.dice = 0.0
 
     def process(self, save_dir: Path = Path("."), plot: bool = False, on_plot=None) -> dict[str, np.ndarray]:
         """Process the detection and segmentation metrics over the given set of predictions.
@@ -1238,6 +1281,10 @@ class SegmentMetrics(DetMetrics):
         )[2:]
         self.seg.nc = len(self.names)
         self.seg.update(results_mask)
+        # extra metrics (image-level mean)
+        self.pq = float(stats["pq"].mean()) if len(stats.get("pq", [])) else 0.0
+        self.aji = float(stats["aji"].mean()) if len(stats.get("aji", [])) else 0.0
+        self.dice = float(stats["dice"].mean()) if len(stats.get("dice", [])) else 0.0
         return stats
 
     @property
@@ -1249,11 +1296,14 @@ class SegmentMetrics(DetMetrics):
             "metrics/recall(M)",
             "metrics/mAP50(M)",
             "metrics/mAP50-95(M)",
+            "metrics/PQ",
+            "metrics/AJI",
+            "metrics/Dice",
         ]
 
     def mean_results(self) -> list[float]:
         """Return the mean metrics for bounding box and segmentation results."""
-        return DetMetrics.mean_results(self) + self.seg.mean_results()
+        return DetMetrics.mean_results(self) + self.seg.mean_results() + [self.pq, self.aji, self.dice]
 
     def class_result(self, i: int) -> list[float]:
         """Return classification results for a specified class index."""

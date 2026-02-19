@@ -1327,7 +1327,7 @@ class SettingsManager(JSONDict):
             "neptune": True,  # Neptune integration
             "raytune": True,  # Ray Tune integration
             "tensorboard": False,  # TensorBoard logging
-            "wandb": False,  # Weights & Biases logging
+            "wandb": True,  # Weights & Biases logging
             "vscode_msg": True,  # VSCode message
             "openvino_msg": True,  # OpenVINO export on Intel CPU message
         }
