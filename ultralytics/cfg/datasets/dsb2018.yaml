@@ -1,0 +1,5 @@
+path: /data_28T/r12_jason/R12922169_Master_Thesis_Project/dataset/dsb2018/standard
+train: train/images
+val: test/images
+channels: 1
+names: [nucleus]
