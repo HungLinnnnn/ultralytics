@@ -1,0 +1,508 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+"""SSM-PAN modules for YOLOv8 segmentation neck experiments."""
+
+from __future__ import annotations
+
+import importlib.util
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+__all__ = (
+    "LLDLow",
+    "LLDHigh",
+    "LowAggP5",
+    "MambaCM",
+    "BDFWarpUp",
+    "SGF",
+    "GateConcat",
+)
+
+
+def _has_selective_scan_backend() -> bool:
+    """Return True if any selective-scan backend module is available."""
+    backend_candidates = (
+        "selective_scan_cuda_core",
+        "selective_scan_cuda_oflex",
+        "selective_scan_cuda",
+        "mamba_ssm",
+    )
+    return any(importlib.util.find_spec(name) is not None for name in backend_candidates)
+
+
+def drop_path(x: torch.Tensor, drop_prob: float = 0.0, training: bool = False) -> torch.Tensor:
+    """Drop paths (Stochastic Depth) per sample when applied in main path of residual blocks."""
+    if drop_prob == 0.0 or not training:
+        return x
+    keep_prob = 1.0 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor.floor_()
+    return x.div(keep_prob) * random_tensor
+
+
+class DropPath(nn.Module):
+    """Drop paths module."""
+
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = float(drop_prob)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return drop_path(x, self.drop_prob, self.training)
+
+
+class LayerNorm2d(nn.Module):
+    """LayerNorm over channel dimension for NCHW tensors."""
+
+    def __init__(self, num_channels: int, eps: float = 1e-6, elementwise_affine: bool = True):
+        super().__init__()
+        self.norm = nn.LayerNorm(num_channels, eps=eps, elementwise_affine=elementwise_affine)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.permute(0, 2, 3, 1).contiguous()
+        x = self.norm(x)
+        return x.permute(0, 3, 1, 2).contiguous()
+
+
+class LSBlock(nn.Module):
+    """Local perception branch used in Mamba-YOLO blocks."""
+
+    def __init__(self, in_features: int, hidden_features: int):
+        super().__init__()
+        self.fc1 = nn.Conv2d(in_features, hidden_features, kernel_size=3, stride=1, padding=1, groups=hidden_features)
+        self.norm = nn.BatchNorm2d(hidden_features)
+        self.fc2 = nn.Conv2d(hidden_features, hidden_features, kernel_size=1, stride=1, padding=0)
+        self.act = nn.GELU()
+        self.fc3 = nn.Conv2d(hidden_features, in_features, kernel_size=1, stride=1, padding=0)
+        self.drop = nn.Dropout(0.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.fc1(x)
+        x = self.norm(x)
+        x = self.fc2(x)
+        x = self.act(x)
+        x = self.fc3(x)
+        return residual + self.drop(x)
+
+
+class RGBlock(nn.Module):
+    """Residual gated block used in Mamba-YOLO."""
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features: int | None = None,
+        out_features: int | None = None,
+        act_layer: type[nn.Module] = nn.GELU,
+        drop: float = 0.0,
+    ):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        hidden_features = int(2 * hidden_features / 3)
+
+        self.fc1 = nn.Conv2d(in_features, hidden_features * 2, kernel_size=1, stride=1, padding=0)
+        self.dwconv = nn.Conv2d(
+            hidden_features,
+            hidden_features,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=True,
+            groups=hidden_features,
+        )
+        self.act = act_layer()
+        self.fc2 = nn.Conv2d(hidden_features, out_features, kernel_size=1, stride=1, padding=0)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x, v = self.fc1(x).chunk(2, dim=1)
+        x = self.act(self.dwconv(x) + x) * v
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+def _flatten_by_direction(x: torch.Tensor, direction: str) -> torch.Tensor:
+    """Flatten feature map to sequence in one of four directions."""
+    if direction == "lr":
+        return x.flatten(2)
+    if direction == "rl":
+        return torch.flip(x, dims=[-1]).flatten(2)
+    if direction == "td":
+        return x.transpose(2, 3).flatten(2)
+    if direction == "bu":
+        return torch.flip(x, dims=[-2]).transpose(2, 3).flatten(2)
+    raise ValueError(f"Unsupported direction: {direction}")
+
+
+def _unflatten_by_direction(seq: torch.Tensor, direction: str, h: int, w: int) -> torch.Tensor:
+    """Map sequence back to feature map for one of four directions."""
+    b, c, _ = seq.shape
+    if direction == "lr":
+        return seq.view(b, c, h, w)
+    if direction == "rl":
+        return torch.flip(seq.view(b, c, h, w), dims=[-1])
+    if direction == "td":
+        return seq.view(b, c, w, h).transpose(2, 3)
+    if direction == "bu":
+        return torch.flip(seq.view(b, c, w, h).transpose(2, 3), dims=[-2])
+    raise ValueError(f"Unsupported direction: {direction}")
+
+
+class SS2DFallback(nn.Module):
+    """Dependency-free SS2D approximation using 4-direction cumulative aggregation."""
+
+    def __init__(self, d_model: int, ssm_ratio: float = 2.0, dropout: float = 0.0):
+        super().__init__()
+        d_inner = max(int(d_model * ssm_ratio), d_model)
+        self.in_proj = nn.Conv2d(d_model, d_inner, kernel_size=1, stride=1, padding=0, bias=False)
+        self.dwconv = nn.Conv2d(d_inner, d_inner, kernel_size=3, stride=1, padding=1, groups=d_inner, bias=True)
+        self.act = nn.SiLU()
+        self.fuse = nn.Conv2d(d_inner * 4, d_inner, kernel_size=1, stride=1, padding=0, bias=False)
+        self.out_proj = nn.Conv2d(d_inner, d_model, kernel_size=1, stride=1, padding=0, bias=False)
+        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+    @staticmethod
+    def _scan(x: torch.Tensor, direction: str) -> torch.Tensor:
+        b, c, h, w = x.shape
+        seq = _flatten_by_direction(x, direction)
+        length = seq.shape[-1]
+        denom = torch.arange(1, length + 1, device=seq.device, dtype=seq.dtype).view(1, 1, length)
+        seq = torch.cumsum(seq, dim=-1) / denom
+        return _unflatten_by_direction(seq, direction, h, w)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.act(self.dwconv(self.in_proj(x)))
+        y = torch.cat([self._scan(x, d) for d in ("lr", "rl", "td", "bu")], dim=1)
+        y = self.fuse(y)
+        y = self.out_proj(y)
+        return self.drop(y)
+
+
+class SS2DSelective(nn.Module):
+    """SS2D selective scan style block with explicit recurrent scan."""
+
+    backend_available = _has_selective_scan_backend()
+
+    def __init__(self, d_model: int, d_state: int = 16, ssm_ratio: float = 2.0, dropout: float = 0.0):
+        super().__init__()
+        _ = d_state  # kept for interface compatibility
+        self.d_inner = max(int(d_model * ssm_ratio), d_model)
+        self.in_proj = nn.Conv2d(d_model, self.d_inner * 2, kernel_size=1, stride=1, padding=0, bias=False)
+        self.dwconv = nn.Conv2d(
+            self.d_inner,
+            self.d_inner,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=self.d_inner,
+            bias=True,
+        )
+        self.param_proj = nn.Conv2d(self.d_inner, self.d_inner * 3, kernel_size=1, stride=1, padding=0, bias=True)
+        self.out_norm = LayerNorm2d(self.d_inner)
+        self.out_proj = nn.Conv2d(self.d_inner, d_model, kernel_size=1, stride=1, padding=0, bias=False)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+    @staticmethod
+    def _scan_1d(u: torch.Tensor, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """Run a selective recurrent scan on sequences of shape (B, C, L)."""
+        bsz, ch, length = u.shape
+        out = torch.zeros_like(u)
+        state = torch.zeros((bsz, ch), dtype=u.dtype, device=u.device)
+        for t in range(length):
+            state = a[:, :, t] * state + b[:, :, t] * u[:, :, t]
+            out[:, :, t] = c[:, :, t] * state
+        return out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h, w = x.shape[2:]
+        x, z = self.in_proj(x).chunk(2, dim=1)
+        x = self.act(self.dwconv(x))
+        delta, b, c = self.param_proj(x).chunk(3, dim=1)
+
+        a = torch.sigmoid(delta)
+        b = torch.sigmoid(b)
+        c = torch.tanh(c)
+
+        outputs = []
+        for direction in ("lr", "rl", "td", "bu"):
+            u_d = _flatten_by_direction(x, direction)
+            a_d = _flatten_by_direction(a, direction)
+            b_d = _flatten_by_direction(b, direction)
+            c_d = _flatten_by_direction(c, direction)
+            y_d = self._scan_1d(u_d, a_d, b_d, c_d)
+            outputs.append(_unflatten_by_direction(y_d, direction, h, w))
+
+        y = sum(outputs) / len(outputs)
+        y = self.out_norm(y)
+        y = y * self.act(z)
+        y = self.out_proj(y)
+        return self.drop(y)
+
+
+class SS2DAuto(nn.Module):
+    """Route SS2D implementation by runtime mode."""
+
+    def __init__(self, d_model: int, d_state: int = 16, ssm_ratio: float = 2.0, dropout: float = 0.0, mode: str = "auto"):
+        super().__init__()
+        self.mode = mode
+        self.has_backend = SS2DSelective.backend_available
+        self.selective = SS2DSelective(d_model, d_state=d_state, ssm_ratio=ssm_ratio, dropout=dropout)
+        self.fallback = SS2DFallback(d_model, ssm_ratio=ssm_ratio, dropout=dropout)
+        self.last_route = "fallback"
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.mode == "strict":
+            if not self.has_backend:
+                raise RuntimeError(
+                    "SS2D strict mode requires selective-scan backend, but none was found. "
+                    "Install selective-scan extensions or use mode='auto'/'fallback'."
+                )
+            self.last_route = "selective"
+            return self.selective(x)
+
+        if self.mode == "fallback":
+            self.last_route = "fallback"
+            return self.fallback(x)
+
+        if self.mode != "auto":
+            raise ValueError(f"Unsupported SS2D mode: {self.mode}")
+
+        if self.has_backend:
+            self.last_route = "selective"
+            return self.selective(x)
+
+        self.last_route = "fallback"
+        return self.fallback(x)
+
+
+class LLDLow(nn.Module):
+    """Low-frequency decomposition branch."""
+
+    def __init__(self, c1: int, k: int = 3):
+    def __init__(self, c1: int, k: int = 5):
+        super().__init__()
+        self.low = nn.Conv2d(c1, c1, kernel_size=k, stride=1, padding=k // 2, groups=c1, bias=False)
+        self.norm = nn.BatchNorm2d(c1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.low(x))
+
+
+class LLDHigh(nn.Module):
+    """High-frequency decomposition branch, implemented by residual split."""
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, xs: list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        if not isinstance(xs, (list, tuple)) or len(xs) != 2:
+            raise ValueError("LLDHigh expects [F, L] as input.")
+        f, l = xs
+        if l.shape[-2:] != f.shape[-2:]:
+            l = F.interpolate(l, size=f.shape[-2:], mode="bilinear", align_corners=False)
+        return f - l
+
+
+class LowAggP5(nn.Module):
+    """Cross-scale low-frequency aggregation on P5 grid."""
+
+    def __init__(self, in_channels: list[int] | tuple[int, int, int], d: int = 256, use_pool: bool = True):
+        super().__init__()
+        if len(in_channels) != 3:
+            raise ValueError("LowAggP5 expects three input channel sizes: [c3, c4, c5].")
+        c3, c4, c5 = in_channels
+        self.use_pool = use_pool
+        self.proj3 = nn.Conv2d(c3, d, kernel_size=1, stride=1, padding=0, bias=False)
+        self.proj4 = nn.Conv2d(c4, d, kernel_size=1, stride=1, padding=0, bias=False)
+        self.proj5 = nn.Conv2d(c5, d, kernel_size=1, stride=1, padding=0, bias=False)
+
+    def forward(self, xs: list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        if not isinstance(xs, (list, tuple)) or len(xs) != 3:
+            raise ValueError("LowAggP5 expects [L3, L4, L5] as input.")
+        l3, l4, l5 = xs
+        p5_size = l5.shape[-2:]
+        if self.use_pool:
+            l3_5 = F.adaptive_avg_pool2d(l3, output_size=p5_size)
+            l4_5 = F.adaptive_avg_pool2d(l4, output_size=p5_size)
+        else:
+            l3_5 = F.interpolate(l3, size=p5_size, mode="bilinear", align_corners=False)
+            l4_5 = F.interpolate(l4, size=p5_size, mode="bilinear", align_corners=False)
+
+        return torch.cat((self.proj3(l3_5), self.proj4(l4_5), self.proj5(l5)), dim=1)
+
+
+class MambaCM(nn.Module):
+    """Global topology mixer at P5 using Mamba-YOLO-style ODSS block."""
+
+    def __init__(
+        self,
+        c1: int,
+        d: int = 256,
+        ssm_d_state: int = 16,
+        ssm_ratio: float = 2.0,
+        mlp_ratio: float = 4.0,
+        drop_path: float = 0.0,
+        ss2d_mode: str = "auto",
+    ):
+        super().__init__()
+        self.proj_conv = nn.Sequential(
+            nn.Conv2d(c1, d, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(d),
+            nn.SiLU(),
+        )
+        self.lsblock = LSBlock(d, d)
+        self.norm1 = LayerNorm2d(d)
+        self.ss2d = SS2DAuto(d_model=d, d_state=ssm_d_state, ssm_ratio=ssm_ratio, dropout=0.0, mode=ss2d_mode)
+        self.drop_path = DropPath(drop_path)
+
+        self.norm2 = LayerNorm2d(d)
+        self.rg = RGBlock(in_features=d, hidden_features=int(d * mlp_ratio), out_features=d, act_layer=nn.GELU, drop=0.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.proj_conv(x)
+        x_local = self.lsblock(x)
+        x = x + self.drop_path(self.ss2d(self.norm1(x_local)))
+        x = x + self.drop_path(self.rg(self.norm2(x)))
+        return x
+
+
+class BDFWarpUp(nn.Module):
+    """High-guided warping upsample with identity-safe offset initialization."""
+
+    def __init__(self, c_src: int, c_high: int, c_low: int = 0, max_offset: float = 1.0):
+    def __init__(self, c_src: int, c_high: int, c_low: int = 0, max_offset: float = 1.0, align_corners: bool = False):
+        super().__init__()
+        self.max_offset = float(max_offset)
+        self.src_proj = nn.Conv2d(c_src, c_high, kernel_size=1, stride=1, padding=0, bias=False)
+        self.low_proj = nn.Conv2d(c_low, c_high, kernel_size=1, stride=1, padding=0, bias=False) if c_low > 0 else None
+
+        c_in = c_high * 2 + (c_high if c_low > 0 else 0)
+        hidden = max(c_high, 16)
+        self.offset_net = nn.Sequential(
+            nn.Conv2d(c_in, hidden, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.SiLU(),
+            nn.Conv2d(hidden, 2, kernel_size=3, stride=1, padding=1, bias=True),
+        )
+
+        last = self.offset_net[-1]
+        nn.init.zeros_(last.weight)
+        nn.init.zeros_(last.bias)
+
+        self.last_offset: torch.Tensor | None = None
+        self.align_corners = align_corners
+
+    @staticmethod
+    def _build_base_grid(batch: int, h: int, w: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        y = torch.linspace(-1.0, 1.0, steps=h, device=device, dtype=dtype)
+        x = torch.linspace(-1.0, 1.0, steps=w, device=device, dtype=dtype)
+        gy, gx = torch.meshgrid(y, x, indexing="ij")
+        grid = torch.stack((gx, gy), dim=-1)
+        return grid.unsqueeze(0).expand(batch, h, w, 2)
+
+    def forward(self, xs: list[torch.Tensor] | tuple[torch.Tensor, ...]) -> torch.Tensor:
+        if not isinstance(xs, (list, tuple)) or len(xs) < 2:
+            raise ValueError("BDFWarpUp expects [src, high_t, low_t(optional)] as input.")
+
+        src = xs[0]
+        high_t = xs[1]
+        low_t = xs[2] if len(xs) > 2 else None
+
+        target_size = high_t.shape[-2:]
+        src_up = F.interpolate(src, size=target_size, mode="bilinear", align_corners=False)
+
+        feat = [high_t, self.src_proj(src_up)]
+        if self.low_proj is not None and low_t is not None:
+            if low_t.shape[-2:] != target_size:
+                low_t = F.interpolate(low_t, size=target_size, mode="bilinear", align_corners=False)
+            feat.append(self.low_proj(low_t))
+
+        offset_raw = self.offset_net(torch.cat(feat, dim=1))
+        offset = self.max_offset * torch.tanh(offset_raw)
+
+        b, _, h, w = offset.shape
+        base_grid = self._build_base_grid(b, h, w, offset.device, offset.dtype)
+
+        if w > 1:
+            offset_x = offset[:, 0] * (2.0 / (w - 1))
+        else:
+            offset_x = torch.zeros_like(offset[:, 0])
+        if h > 1:
+            offset_y = offset[:, 1] * (2.0 / (h - 1))
+        else:
+            offset_y = torch.zeros_like(offset[:, 1])
+
+        norm_offset = torch.stack((offset_x, offset_y), dim=-1)
+        grid = base_grid + norm_offset
+        aligned = F.grid_sample(src_up, grid, mode="bilinear", padding_mode="border", align_corners=True)
+        aligned = F.grid_sample(src_up, grid, mode="bilinear", padding_mode="border", align_corners=self.align_corners)
+
+        self.last_offset = offset.detach()
+        return aligned
+
+
+class SGF(nn.Module):
+    """Spectral Gated Fusion with residual safety path."""
+
+    def __init__(self, c_m: int, c_b: int, c_e: int, c_out: int, residual: bool = True, alpha_init: float = 0.0):
+        super().__init__()
+        self.residual = bool(residual)
+
+        self.m_gate = nn.Conv2d(c_m, 1, kernel_size=1, stride=1, padding=0, bias=True)
+        self.e_gate = nn.Conv2d(c_e, 1, kernel_size=1, stride=1, padding=0, bias=True)
+        self.fuse = nn.Conv2d(c_m + c_b, c_out, kernel_size=1, stride=1, padding=0, bias=False)
+        self.skip = nn.Conv2d(c_m, c_out, kernel_size=1, stride=1, padding=0, bias=False) if c_m != c_out else nn.Identity()
+        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+
+    def forward(self, xs: list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        if not isinstance(xs, (list, tuple)) or len(xs) != 3:
+            raise ValueError("SGF expects [M, B, E] as input.")
+
+        m, b, e = xs
+        target_size = m.shape[-2:]
+        if b.shape[-2:] != target_size:
+            b = F.interpolate(b, size=target_size, mode="bilinear", align_corners=False)
+        if e.shape[-2:] != target_size:
+            e = F.interpolate(e, size=target_size, mode="bilinear", align_corners=False)
+
+        w_m = torch.sigmoid(self.m_gate(m))
+        w_e = 1.0 + torch.tanh(self.e_gate(e))
+
+        b_prime = b * w_m
+        m_prime = m * w_e
+        fused = self.fuse(torch.cat((m_prime, b_prime), dim=1))
+
+        if self.residual:
+            return self.skip(m) + self.alpha * fused
+        return fused
+
+
+class GateConcat(nn.Module):
+    """Bottom-up selective routing gate for concat fusion."""
+
+    def __init__(self, c_x: int, c_y: int, c_guide: int, init_bias: float = 2.0):
+        super().__init__()
+        _ = c_y
+        self.gate = nn.Conv2d(c_guide, 1, kernel_size=1, stride=1, padding=0, bias=True)
+        nn.init.constant_(self.gate.bias, float(init_bias))
+        nn.init.normal_(self.gate.weight, mean=0.0, std=0.01)
+
+    def forward(self, xs: list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        if not isinstance(xs, (list, tuple)) or len(xs) != 3:
+            raise ValueError("GateConcat expects [x, y, guide] as input.")
+
+        x, y, guide = xs
+        target_size = x.shape[-2:]
+        if y.shape[-2:] != target_size:
+            y = F.interpolate(y, size=target_size, mode="bilinear", align_corners=False)
+        if guide.shape[-2:] != target_size:
+            guide = F.interpolate(guide, size=target_size, mode="bilinear", align_corners=False)
+
+        w = torch.sigmoid(self.gate(guide))
+        x_gated = x * w
+        return torch.cat((x_gated, y), dim=1)

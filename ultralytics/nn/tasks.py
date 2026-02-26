@@ -55,6 +55,13 @@ from ultralytics.nn.modules import (
     ImagePoolingAttn,
     Index,
     LRPCHead,
+    BDFWarpUp,
+    GateConcat,
+    LLDHigh,
+    LLDLow,
+    LowAggP5,
+    MambaCM,
+    SGF,
     Pose,
     Pose26,
     RepC3,
@@ -1643,6 +1650,51 @@ def parse_model(d, ch, verbose=True):
                     args.extend((True, 1.2))
             if m is C2fCIB:
                 legacy = False
+        elif m is LLDLow:
+            c1 = ch[f]
+            k = args[0] if args else 3
+            args = [c1, k]
+            c2 = c1
+        elif m is LLDHigh:
+            c2 = ch[f[0]] if isinstance(f, list) else ch[f]
+            args = []
+        elif m is LowAggP5:
+            d_out = args[0] if args else ch[f[-1]]
+            use_pool = args[1] if len(args) > 1 else True
+            d_out = make_divisible(min(d_out, max_channels) * width, 8)
+            args = [[ch[x] for x in f], d_out, use_pool]
+            c2 = 3 * d_out
+        elif m is MambaCM:
+            c1 = ch[f]
+            d_out = args[0] if args else c1
+            d_out = make_divisible(min(d_out, max_channels) * width, 8)
+            ssm_d_state = args[1] if len(args) > 1 else 16
+            ssm_ratio = args[2] if len(args) > 2 else 2.0
+            mlp_ratio = args[3] if len(args) > 3 else 4.0
+            drop_path = args[4] if len(args) > 4 else 0.0
+            ss2d_mode = args[5] if len(args) > 5 else "auto"
+            args = [c1, d_out, ssm_d_state, ssm_ratio, mlp_ratio, drop_path, ss2d_mode]
+            c2 = d_out
+        elif m is BDFWarpUp:
+            c_src = ch[f[0]]
+            c_high = ch[f[1]]
+            c_low = ch[f[2]] if len(f) > 2 else 0
+            max_offset = args[0] if args else 1.0
+            args = [c_src, c_high, c_low, max_offset]
+            c2 = c_src
+        elif m is SGF:
+            c_m, c_b, c_e = ch[f[0]], ch[f[1]], ch[f[2]]
+            c_out = args[0] if args else c_m
+            c_out = make_divisible(min(c_out, max_channels) * width, 8)
+            residual = args[1] if len(args) > 1 else True
+            alpha_init = args[2] if len(args) > 2 else 0.0
+            args = [c_m, c_b, c_e, c_out, residual, alpha_init]
+            c2 = c_out
+        elif m is GateConcat:
+            c_x, c_y, c_guide = ch[f[0]], ch[f[1]], ch[f[2]]
+            init_bias = args[0] if args else 2.0
+            args = [c_x, c_y, c_guide, init_bias]
+            c2 = c_x + c_y
         elif m is AIFI:
             args = [ch[f], *args]
         elif m in frozenset({HGStem, HGBlock}):

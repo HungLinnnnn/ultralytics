@@ -1251,10 +1251,40 @@ class SegmentMetrics(DetMetrics):
         self.seg = Metric()
         self.task = "segment"
         # additional stats
-        self.stats.update({"tp_m": [], "pq": [], "aji": [], "dice": []})
+        self.stats.update(
+            {
+                "tp_m": [],
+                "pq": [],
+                "sq": [],
+                "rq": [],
+                "aji": [],
+                "dice": [],
+                "tp_cnt": [],
+                "fp_cnt": [],
+                "fn_cnt": [],
+                "iou_sum_tp": [],
+                "ng_inst": [],
+                "np_inst": [],
+                "split_count": [],
+                "merge_count": [],
+                "split_rate": [],
+                "merge_rate": [],
+                "mean_iou_tp": [],
+            }
+        )
         self.pq = 0.0
+        self.sq = 0.0
+        self.rq = 0.0
         self.aji = 0.0
         self.dice = 0.0
+        self.split_rate = 0.0
+        self.merge_rate = 0.0
+        self.tp = 0.0
+        self.fp = 0.0
+        self.fn = 0.0
+        self.split_count = 0.0
+        self.merge_count = 0.0
+        self.mean_iou_tp = 0.0
 
     def process(self, save_dir: Path = Path("."), plot: bool = False, on_plot=None) -> dict[str, np.ndarray]:
         """Process the detection and segmentation metrics over the given set of predictions.
@@ -1281,10 +1311,24 @@ class SegmentMetrics(DetMetrics):
         )[2:]
         self.seg.nc = len(self.names)
         self.seg.update(results_mask)
-        # extra metrics (image-level mean)
-        self.pq = float(stats["pq"].mean()) if len(stats.get("pq", [])) else 0.0
+        # extra metrics
+        self.tp = float(stats["tp_cnt"].sum()) if len(stats.get("tp_cnt", [])) else 0.0
+        self.fp = float(stats["fp_cnt"].sum()) if len(stats.get("fp_cnt", [])) else 0.0
+        self.fn = float(stats["fn_cnt"].sum()) if len(stats.get("fn_cnt", [])) else 0.0
+        iou_sum_tp = float(stats["iou_sum_tp"].sum()) if len(stats.get("iou_sum_tp", [])) else 0.0
+        rq_denom = self.tp + 0.5 * self.fp + 0.5 * self.fn
+        self.rq = float(self.tp / rq_denom) if rq_denom > 0 else 0.0
+        self.sq = float(iou_sum_tp / self.tp) if self.tp > 0 else 0.0
+        self.pq = float(self.sq * self.rq)
         self.aji = float(stats["aji"].mean()) if len(stats.get("aji", [])) else 0.0
         self.dice = float(stats["dice"].mean()) if len(stats.get("dice", [])) else 0.0
+        ng_inst = float(stats["ng_inst"].sum()) if len(stats.get("ng_inst", [])) else 0.0
+        np_inst = float(stats["np_inst"].sum()) if len(stats.get("np_inst", [])) else 0.0
+        self.split_count = float(stats["split_count"].sum()) if len(stats.get("split_count", [])) else 0.0
+        self.merge_count = float(stats["merge_count"].sum()) if len(stats.get("merge_count", [])) else 0.0
+        self.split_rate = float(self.split_count / ng_inst) if ng_inst > 0 else 0.0
+        self.merge_rate = float(self.merge_count / np_inst) if np_inst > 0 else 0.0
+        self.mean_iou_tp = self.sq
         return stats
 
     @property
@@ -1297,13 +1341,37 @@ class SegmentMetrics(DetMetrics):
             "metrics/mAP50(M)",
             "metrics/mAP50-95(M)",
             "metrics/PQ",
+            "metrics/SQ",
+            "metrics/RQ",
             "metrics/AJI",
             "metrics/Dice",
+            "metrics/split_rate",
+            "metrics/merge_rate",
+            "metrics/TP",
+            "metrics/FP",
+            "metrics/FN",
+            "metrics/split_count",
+            "metrics/merge_count",
+            "metrics/mean_iou_tp",
         ]
 
     def mean_results(self) -> list[float]:
         """Return the mean metrics for bounding box and segmentation results."""
-        return DetMetrics.mean_results(self) + self.seg.mean_results() + [self.pq, self.aji, self.dice]
+        return DetMetrics.mean_results(self) + self.seg.mean_results() + [
+            self.pq,
+            self.sq,
+            self.rq,
+            self.aji,
+            self.dice,
+            self.split_rate,
+            self.merge_rate,
+            self.tp,
+            self.fp,
+            self.fn,
+            self.split_count,
+            self.merge_count,
+            self.mean_iou_tp,
+        ]
 
     def class_result(self, i: int) -> list[float]:
         """Return classification results for a specified class index."""
