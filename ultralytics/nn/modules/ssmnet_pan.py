@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import importlib.util
 import torch
 import torch.nn as nn
@@ -282,31 +283,102 @@ class SS2DAuto(nn.Module):
 
 
 class LLDLow(nn.Module):
-    """Low-frequency decomposition branch."""
+    """
+    Learnable Gaussian Low-Pass Filter (LLDLow).
+    
+    Mechanism:
+        Instead of learning weights directly, this module learns the 'sigma' (standard deviation)
+        of a Gaussian kernel per channel. This enforces a strict physical low-pass constraint
+        while allowing the network to adapt the blur radius for different features.
+    """
 
-    def __init__(self, c1: int, k: int = 3):
     def __init__(self, c1: int, k: int = 5):
         super().__init__()
-        self.low = nn.Conv2d(c1, c1, kernel_size=k, stride=1, padding=k // 2, groups=c1, bias=False)
-        self.norm = nn.BatchNorm2d(c1)
+        self.k = k
+        self.c1 = c1
+        self.padding = k // 2
+        self.groups = c1
+        
+        # 1. Learnable Parameter: Sigma
+        # Initialize sigma=1.0. A value of 1.0 is a balanced blur.
+        self.sigma = nn.Parameter(torch.ones(c1, 1, 1, 1))
+        
+        # 2. Fixed Coordinate Grid (Buffer)
+        self.register_buffer('dist_sq', self._build_dist_sq(k))
+
+    @staticmethod
+    def _build_dist_sq(k: int) -> torch.Tensor:
+        """Generates the squared distance grid (x^2 + y^2) for a kxk kernel."""
+        ax = torch.arange(k, dtype=torch.float32) - (k - 1) / 2.0
+        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+        return xx.pow(2) + yy.pow(2)
+
+    def get_kernel(self) -> torch.Tensor:
+        """Dynamically generates the Gaussian kernel based on current sigma."""
+        sigma = F.softplus(self.sigma) + 0.1
+        dist = self.dist_sq.to(sigma.device)
+        gamma = 1.0 / (2 * sigma.pow(2))
+        kernel = torch.exp(-dist * gamma)
+        kernel_sum = kernel.sum(dim=(-2, -1), keepdim=True)
+        return kernel / kernel_sum
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.norm(self.low(x))
+        kernel = self.get_kernel()
+        return F.conv2d(x, kernel, stride=1, padding=self.padding, groups=self.groups)
 
 
 class LLDHigh(nn.Module):
-    """High-frequency decomposition branch, implemented by residual split."""
+    """Decomposes high frequency using Laplacian Residual + Fixed Gabor priors."""
 
-    def __init__(self):
+    def __init__(self, c1: int | list[int]):
         super().__init__()
+        c_in = c1[0] if isinstance(c1, (list, tuple)) else c1
+
+        self.fusion = nn.Conv2d(c_in * 2, c_in, 1, 1, 0)
+
+        # Gabor filters must be absolutely non-learnable.
+        # We register them as a buffer so they are part of the state_dict but not parameters.
+        gabor_weights = torch.zeros((c_in, 1, 3, 3))
+        for i in range(c_in):
+            theta = (i % 4) * (math.pi / 4)
+            gabor_weights[i, 0] = self._gabor_kernel(3, theta)
+        
+        self.register_buffer('gabor_kernel', gabor_weights)
+
+    @staticmethod
+    def _gabor_kernel(
+        k: int,
+        theta: float,
+        sigma: float = 1.0,
+        lambd: float = 4.0,
+        gamma: float = 0.5,
+    ) -> torch.Tensor:
+        d = k // 2
+        coords = torch.arange(-d, d + 1, dtype=torch.float32)
+        y, x = torch.meshgrid(coords, coords, indexing="ij")
+
+        x_prime = x * math.cos(theta) + y * math.sin(theta)
+        y_prime = -x * math.sin(theta) + y * math.cos(theta)
+
+        g = torch.exp(-(x_prime**2 + (gamma**2) * (y_prime**2)) / (2 * (sigma**2)))
+        g = g * torch.cos(2 * math.pi * x_prime / lambd)
+        g = g - g.mean()
+        g = g / (g.std() + 1e-6)
+        return g
 
     def forward(self, xs: list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         if not isinstance(xs, (list, tuple)) or len(xs) != 2:
             raise ValueError("LLDHigh expects [F, L] as input.")
-        f, l = xs
-        if l.shape[-2:] != f.shape[-2:]:
-            l = F.interpolate(l, size=f.shape[-2:], mode="bilinear", align_corners=False)
-        return f - l
+
+        f_raw, f_low = xs
+        if f_low.shape[-2:] != f_raw.shape[-2:]:
+            f_low = F.interpolate(f_low, size=f_raw.shape[-2:], mode="bilinear", align_corners=False)
+
+        high_res = f_raw - f_low
+        
+        # Use functional conv2d with the fixed buffer
+        high_edge = F.conv2d(f_raw, self.gabor_kernel, padding=1, groups=f_raw.shape[1])
+        return self.fusion(torch.cat([high_res, high_edge], dim=1))
 
 
 class LowAggP5(nn.Module):
@@ -375,8 +447,7 @@ class MambaCM(nn.Module):
 class BDFWarpUp(nn.Module):
     """High-guided warping upsample with identity-safe offset initialization."""
 
-    def __init__(self, c_src: int, c_high: int, c_low: int = 0, max_offset: float = 1.0):
-    def __init__(self, c_src: int, c_high: int, c_low: int = 0, max_offset: float = 1.0, align_corners: bool = False):
+    def __init__(self, c_src: int, c_high: int, c_low: int = 0, max_offset: float = 2.0, align_corners: bool = False):
         super().__init__()
         self.max_offset = float(max_offset)
         self.src_proj = nn.Conv2d(c_src, c_high, kernel_size=1, stride=1, padding=0, bias=False)
@@ -414,12 +485,12 @@ class BDFWarpUp(nn.Module):
         low_t = xs[2] if len(xs) > 2 else None
 
         target_size = high_t.shape[-2:]
-        src_up = F.interpolate(src, size=target_size, mode="bilinear", align_corners=False)
+        src_up = F.interpolate(src, size=target_size, mode="bilinear", align_corners=self.align_corners)
 
         feat = [high_t, self.src_proj(src_up)]
         if self.low_proj is not None and low_t is not None:
             if low_t.shape[-2:] != target_size:
-                low_t = F.interpolate(low_t, size=target_size, mode="bilinear", align_corners=False)
+                low_t = F.interpolate(low_t, size=target_size, mode="bilinear", align_corners=self.align_corners)
             feat.append(self.low_proj(low_t))
 
         offset_raw = self.offset_net(torch.cat(feat, dim=1))
@@ -439,17 +510,20 @@ class BDFWarpUp(nn.Module):
 
         norm_offset = torch.stack((offset_x, offset_y), dim=-1)
         grid = base_grid + norm_offset
-        aligned = F.grid_sample(src_up, grid, mode="bilinear", padding_mode="border", align_corners=True)
         aligned = F.grid_sample(src_up, grid, mode="bilinear", padding_mode="border", align_corners=self.align_corners)
 
-        self.last_offset = offset.detach()
+        # Always store offset for visualization/debugging purposes
+        self.last_offset = offset
+
+        if self.training:
+            return aligned, offset
         return aligned
 
 
 class SGF(nn.Module):
     """Spectral Gated Fusion with residual safety path."""
 
-    def __init__(self, c_m: int, c_b: int, c_e: int, c_out: int, residual: bool = True, alpha_init: float = 0.0):
+    def __init__(self, c_m: int, c_b: int, c_e: int, c_out: int, residual: bool = True, alpha_init: float = 0.2):
         super().__init__()
         self.residual = bool(residual)
 
@@ -457,13 +531,18 @@ class SGF(nn.Module):
         self.e_gate = nn.Conv2d(c_e, 1, kernel_size=1, stride=1, padding=0, bias=True)
         self.fuse = nn.Conv2d(c_m + c_b, c_out, kernel_size=1, stride=1, padding=0, bias=False)
         self.skip = nn.Conv2d(c_m, c_out, kernel_size=1, stride=1, padding=0, bias=False) if c_m != c_out else nn.Identity()
-        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+        
+        # Channel-wise alpha to prevent gradient starvation
+        self.alpha = nn.Parameter(torch.ones(1, c_out, 1, 1) * alpha_init)
 
     def forward(self, xs: list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> torch.Tensor:
         if not isinstance(xs, (list, tuple)) or len(xs) != 3:
             raise ValueError("SGF expects [M, B, E] as input.")
 
         m, b, e = xs
+        # Handle tuple input from BDFWarpUp (training mode)
+        if isinstance(m, (list, tuple)):
+            m = m[0]
         target_size = m.shape[-2:]
         if b.shape[-2:] != target_size:
             b = F.interpolate(b, size=target_size, mode="bilinear", align_corners=False)
@@ -497,6 +576,9 @@ class GateConcat(nn.Module):
             raise ValueError("GateConcat expects [x, y, guide] as input.")
 
         x, y, guide = xs
+        # Handle tuple input from BDFWarpUp (if used as input)
+        if isinstance(x, (list, tuple)):
+            x = x[0]
         target_size = x.shape[-2:]
         if y.shape[-2:] != target_size:
             y = F.interpolate(y, size=target_size, mode="bilinear", align_corners=False)

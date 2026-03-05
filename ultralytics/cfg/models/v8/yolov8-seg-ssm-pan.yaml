@@ -29,30 +29,27 @@ backbone:
 
 head:
   # --- LLD decomposition ---
-  - [4, 1, LLDLow, [3]] # 10 L3
   - [4, 1, LLDLow, [5]] # 10 L3
   - [[4, 10], 1, LLDHigh, []] # 11 H3
-  - [6, 1, LLDLow, [3]] # 12 L4
   - [6, 1, LLDLow, [5]] # 12 L4
   - [[6, 12], 1, LLDHigh, []] # 13 H4
-  - [9, 1, LLDLow, [3]] # 14 L5
   - [9, 1, LLDLow, [5]] # 14 L5
 
   # --- P5 global anchor ---
-  - [[10, 12, 14], 1, LowAggP5, [256, True]] # 15 Z5
-  - [15, 1, MambaCM, [256, 16, 2.0, 4.0, 0.0, "auto"]] # 16 G5
-  - [[16, 14], 1, Concat, [1]] # 17
+  - [[10, 12, 14], 1, LowAggP5, [256, True]] # 15 Z5 (from L3, L4, L5)
+  - [15, 1, MambaCM, [256, 32, 2.0, 4.0, 0.0, "auto"]] # 16 G5
+  - [[16, 14], 1, Concat, [1]] # 17 (G5 || L5)
   - [-1, 1, Conv, [256, 1, 1]] # 18 S5
 
   # --- Top-down P5 -> P4 ---
-  - [[18, 13, 12], 1, BDFWarpUp, [1.0]] # 19 A4
-  - [[19, 12, 13], 1, SGF, [512, True, 0.0]] # 20 F4_in
-  - [-1, 3, C2f, [512]] # 21 F4
+  - [[18, 13, 12], 1, BDFWarpUp, [2.0, False]] # 19 A4 (src=S5, high_t=H4, low_t=L4)
+  - [[19, 12, 13], 1, SGF, [512, True, 0.2]] # 20 F4_in (M=A4, B=L4, E=H4)
+  - [-1, 3, C2f, [512]] # 21 F4 (top-down P4)
 
   # --- Top-down P4 -> P3 ---
-  - [[21, 11, 10], 1, BDFWarpUp, [1.0]] # 22 A3
-  - [[22, 10, 11], 1, SGF, [256, True, 0.0]] # 23 F3_in
-  - [-1, 3, C2f, [256]] # 24 F3
+  - [[21, 11, 10], 1, BDFWarpUp, [2.0, False]] # 22 A3 (src=F4, high_t=H3, low_t=L3)
+  - [[22, 10, 11], 1, SGF, [256, True, 0.2]] # 23 F3_in (M=A3, B=L3, E=H3)
+  - [-1, 3, C2f, [256]] # 24 F3 (top-down P3)
 
   # --- Bottom-up P3 -> P4 (guide = F4) ---
   - [-1, 1, Conv, [256, 3, 2]] # 25 D4
@@ -61,8 +58,8 @@ head:
 
   # --- Bottom-up P4 -> P5 (guide = G5) ---
   - [-1, 1, Conv, [512, 3, 2]] # 28 D5
-  - [[28, 18, 16], 1, GateConcat, []] # 29 BU5
+  - [[28, 18, 16], 1, GateConcat, []] # 29 BU5 = GateConcat(x=D5, y=S5, guide=G5)
   - [-1, 3, C2f, [1024]] # 30 F5_out
 
   # --- Segment head ---
-  - [[24, 27, 30], 1, Segment, [nc, 32, 256]] # 31 Segment(P3, P4, P5)
+  - [[24, 27, 30], 1, Segment, [nc, 32, 256]] # 31 Segment(F3, F4_out, F5_out)

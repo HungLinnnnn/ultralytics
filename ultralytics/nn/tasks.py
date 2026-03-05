@@ -416,6 +416,10 @@ class DetectionModel(BaseModel):
             m.training = True  # Setting it to True to properly return strides
             m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward
             self.stride = m.stride
+            # Clear transient cached tensors (e.g., BDFWarpUp.last_offset) after dummy stride forward.
+            for module in self.model.modules():
+                if hasattr(module, "last_offset"):
+                    module.last_offset = None
             self.model.train()  # Set model back to training(default) mode
             m.bias_init()  # only run once
         else:
@@ -1657,7 +1661,7 @@ def parse_model(d, ch, verbose=True):
             c2 = c1
         elif m is LLDHigh:
             c2 = ch[f[0]] if isinstance(f, list) else ch[f]
-            args = []
+            args = [c2]
         elif m is LowAggP5:
             d_out = args[0] if args else ch[f[-1]]
             use_pool = args[1] if len(args) > 1 else True
@@ -1679,8 +1683,9 @@ def parse_model(d, ch, verbose=True):
             c_src = ch[f[0]]
             c_high = ch[f[1]]
             c_low = ch[f[2]] if len(f) > 2 else 0
-            max_offset = args[0] if args else 1.0
-            args = [c_src, c_high, c_low, max_offset]
+            max_offset = args[0] if args else 2.0
+            align_corners = args[1] if len(args) > 1 else False
+            args = [c_src, c_high, c_low, max_offset, align_corners]
             c2 = c_src
         elif m is SGF:
             c_m, c_b, c_e = ch[f[0]], ch[f[1]], ch[f[2]]

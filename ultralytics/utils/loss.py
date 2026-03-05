@@ -8,6 +8,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from ultralytics.nn.modules.ssm_loss import SSMLoss
+from ultralytics.nn.modules.ssmnet_pan import BDFWarpUp
 
 from ultralytics.utils.metrics import OKS_SIGMA, RLE_WEIGHT
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
@@ -476,6 +478,8 @@ class v8SegmentationLoss(v8DetectionLoss):
         super().__init__(model, tal_topk, tal_topk2)
         self.overlap = model.args.overlap_mask
         self.bcedice_loss = BCEDiceLoss(weight_bce=0.5, weight_dice=0.5)
+        self.bdf_modules = [m for m in model.modules() if isinstance(m, BDFWarpUp)]
+        self.ssm_loss = SSMLoss(weight=0.1)
 
     def loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate and return the combined loss for detection and segmentation."""
@@ -535,7 +539,14 @@ class v8SegmentationLoss(v8DetectionLoss):
                 loss[4] += (pred_semseg * 0).sum()
 
         loss[1] *= self.hyp.box  # seg gain
-        return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
+        total_loss = loss.sum()
+        if self.bdf_modules:
+            offsets = [m.last_offset for m in self.bdf_modules if m.last_offset is not None]
+            tv_loss = self.ssm_loss(offsets)
+            if isinstance(tv_loss, torch.Tensor):
+                tv_loss = tv_loss.to(loss.device)
+                total_loss += tv_loss
+        return total_loss * batch_size, loss.detach()  # total loss for backward, 5 loss items for logging
 
     @staticmethod
     def single_mask_loss(
