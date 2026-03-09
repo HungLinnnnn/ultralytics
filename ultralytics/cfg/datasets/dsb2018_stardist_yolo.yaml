@@ -1,0 +1,6 @@
+path: /home/r13922151/cell_datasets/dataset/dsb2018/stardist_yolo
+train: train/images
+val: test/images
+nc: 1
+channels: 1
+names: [nucleus]

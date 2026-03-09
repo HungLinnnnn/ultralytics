@@ -1,24 +1,46 @@
 yolo settings wandb=True
+
+DATA=ultralytics/cfg/datasets/dsb2018_stardist_yolo.yaml
+PROJECT=DSB2018_stardist
+# ultralytics/cfg/datasets/dsb2018_from_ASFYOLO.yaml （asf-yolo用的）
+# ultralytics/cfg/datasets/dsb2018.yaml （學長用的）
+# /home/r13922151/miniconda3/envs/yolo-ssm/bin/python ultralytics/scripts/convert_stardist_masks_to_yoloseg.py \
+#   --src /home/r13922151/cell_datasets/dataset/dsb2018/stardist \
+#   --dst /home/r13922151/cell_datasets/dataset/dsb2018/stardist_yolo \
+#   --splits train test --image-link-mode symlink --overwrite
+
 # CUDA_VISIBLE_DEVICES=1 \
 # yolo segment train \
 #     model=ultralytics/cfg/models/v8/yolov8-seg.yaml \
-#     data=ultralytics/cfg/datasets/dsb2018.yaml \
+#     data=$DATA \
 #     batch=128 epochs=1000 device=1 \
 #     pretrained=yolov8n-seg.pt \
-#     project=DSB2018 name=yolov8-seg-baseline-epoch1000-native \
+#     project=$PROJECT name=baseline \
+#     seg_metric_backend=native seg_metric_legacy_pq_reduce=imagewise \
+#     patience=300
+
+
+# SSM-PAN variant example (keeps baseline command above unchanged):
+# CUDA_VISIBLE_DEVICES=3 \
+# yolo segment train \
+#     model=ultralytics/cfg/models/v8/yolov8-seg-ssm-pan.yaml \
+#     data=ultralytics/cfg/datasets/dsb2018.yaml \
+#     batch=128 epochs=1000 device=3 \
+#     pretrained=yolov8n-seg.pt \
+#     project=DSB2018 name=yolov8-seg-ssm-pan-LLDLowFixed-LLDHighGaborFixed-alpheInit0.2-native \
 #     seg_metric_backend=native seg_metric_legacy_pq_reduce=imagewise \
 #     patience=250
 
-# SSM-PAN variant example (keeps baseline command above unchanged):
 CUDA_VISIBLE_DEVICES=3 \
 yolo segment train \
-    model=ultralytics/cfg/models/v8/yolov8-seg-ssm-pan.yaml \
-    data=ultralytics/cfg/datasets/dsb2018.yaml \
+    model=ultralytics/cfg/models/v8/yolov8-seg-ssm-pan/alphainit0.yaml \
+    data=$DATA \
     batch=128 epochs=1000 device=3 \
     pretrained=yolov8n-seg.pt \
-    project=DSB2018 name=yolov8-seg-ssm-pan-LLDLowFixed-LLDHighGaborFixed-alpheInit0.2-native \
+    project=$PROJECT name=alpheInit0 \
     seg_metric_backend=native seg_metric_legacy_pq_reduce=imagewise \
-    patience=250
+    patience=300
+
 
 # Optional segmentation metric backend switch examples:
 # yolo segment val model=... data=... seg_metric_backend=native (default, faster but less accurate than legacy)
