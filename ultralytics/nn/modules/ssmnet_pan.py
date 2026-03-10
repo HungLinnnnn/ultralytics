@@ -4,14 +4,16 @@
 from __future__ import annotations
 
 import math
-import importlib.util
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .mamba_scan_utils import HAS_SELECTIVE_SCAN_BACKEND, SelectiveScanCore, cross_selective_scan
+
 __all__ = (
     "LLDLow",
     "LLDHigh",
+    "LLDHigh_noGabor",
     "LowAggP5",
     "MambaCM",
     "BDFWarpUp",
@@ -21,14 +23,8 @@ __all__ = (
 
 
 def _has_selective_scan_backend() -> bool:
-    """Return True if any selective-scan backend module is available."""
-    backend_candidates = (
-        "selective_scan_cuda_core",
-        "selective_scan_cuda_oflex",
-        "selective_scan_cuda",
-        "mamba_ssm",
-    )
-    return any(importlib.util.find_spec(name) is not None for name in backend_candidates)
+    """Return True when a selective-scan backend is available."""
+    return HAS_SELECTIVE_SCAN_BACKEND
 
 
 def drop_path(x: torch.Tensor, drop_prob: float = 0.0, training: bool = False) -> torch.Tensor:
@@ -185,62 +181,65 @@ class SS2DFallback(nn.Module):
 
 
 class SS2DSelective(nn.Module):
-    """SS2D selective scan style block with explicit recurrent scan."""
+    """Mamba-YOLO-style SS2D selective scan block."""
 
     backend_available = _has_selective_scan_backend()
 
     def __init__(self, d_model: int, d_state: int = 16, ssm_ratio: float = 2.0, dropout: float = 0.0):
         super().__init__()
-        _ = d_state  # kept for interface compatibility
-        self.d_inner = max(int(d_model * ssm_ratio), d_model)
-        self.in_proj = nn.Conv2d(d_model, self.d_inner * 2, kernel_size=1, stride=1, padding=0, bias=False)
+        self.k_group = 4
+        self.d_expand = max(int(ssm_ratio * d_model), d_model)
+        self.d_state = int(d_state)
+        self.dt_rank = math.ceil(d_model / 16)
+
+        self.in_proj = nn.Conv2d(d_model, self.d_expand * 2, kernel_size=1, stride=1, padding=0, bias=False)
         self.dwconv = nn.Conv2d(
-            self.d_inner,
-            self.d_inner,
+            self.d_expand,
+            self.d_expand,
             kernel_size=3,
             stride=1,
             padding=1,
-            groups=self.d_inner,
+            groups=self.d_expand,
             bias=True,
         )
-        self.param_proj = nn.Conv2d(self.d_inner, self.d_inner * 3, kernel_size=1, stride=1, padding=0, bias=True)
-        self.out_norm = LayerNorm2d(self.d_inner)
-        self.out_proj = nn.Conv2d(self.d_inner, d_model, kernel_size=1, stride=1, padding=0, bias=False)
+
+        x_proj = [
+            nn.Linear(self.d_expand, self.dt_rank + self.d_state * 2, bias=False)
+            for _ in range(self.k_group)
+        ]
+        self.x_proj_weight = nn.Parameter(torch.stack([t.weight for t in x_proj], dim=0))
+        del x_proj
+
+        self.dt_projs_weight = nn.Parameter(torch.randn(self.k_group, self.d_expand, self.dt_rank))
+        self.dt_projs_bias = nn.Parameter(torch.randn(self.k_group, self.d_expand))
+        self.A_logs = nn.Parameter(torch.zeros(self.k_group * self.d_expand, self.d_state))
+        self.Ds = nn.Parameter(torch.ones(self.k_group * self.d_expand))
+
+        self.out_norm = nn.LayerNorm(self.d_expand)
+        self.out_proj = nn.Conv2d(self.d_expand, d_model, kernel_size=1, stride=1, padding=0, bias=False)
         self.act = nn.GELU()
         self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
-    @staticmethod
-    def _scan_1d(u: torch.Tensor, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        """Run a selective recurrent scan on sequences of shape (B, C, L)."""
-        bsz, ch, length = u.shape
-        out = torch.zeros_like(u)
-        state = torch.zeros((bsz, ch), dtype=u.dtype, device=u.device)
-        for t in range(length):
-            state = a[:, :, t] * state + b[:, :, t] * u[:, :, t]
-            out[:, :, t] = c[:, :, t] * state
-        return out
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h, w = x.shape[2:]
         x, z = self.in_proj(x).chunk(2, dim=1)
         x = self.act(self.dwconv(x))
-        delta, b, c = self.param_proj(x).chunk(3, dim=1)
 
-        a = torch.sigmoid(delta)
-        b = torch.sigmoid(b)
-        c = torch.tanh(c)
-
-        outputs = []
-        for direction in ("lr", "rl", "td", "bu"):
-            u_d = _flatten_by_direction(x, direction)
-            a_d = _flatten_by_direction(a, direction)
-            b_d = _flatten_by_direction(b, direction)
-            c_d = _flatten_by_direction(c, direction)
-            y_d = self._scan_1d(u_d, a_d, b_d, c_d)
-            outputs.append(_unflatten_by_direction(y_d, direction, h, w))
-
-        y = sum(outputs) / len(outputs)
-        y = self.out_norm(y)
+        y = cross_selective_scan(
+            x=x,
+            x_proj_weight=self.x_proj_weight,
+            x_proj_bias=None,
+            dt_projs_weight=self.dt_projs_weight,
+            dt_projs_bias=self.dt_projs_bias,
+            a_logs=self.A_logs,
+            ds=self.Ds,
+            out_norm=self.out_norm,
+            out_norm_shape="v0",
+            delta_softplus=True,
+            force_fp32=self.training,
+            selective_scan=SelectiveScanCore,
+            ssoflex=self.training,
+        )
+        y = y.permute(0, 3, 1, 2).contiguous()
         y = y * self.act(z)
         y = self.out_proj(y)
         return self.drop(y)
@@ -264,6 +263,9 @@ class SS2DAuto(nn.Module):
                     "SS2D strict mode requires selective-scan backend, but none was found. "
                     "Install selective-scan extensions or use mode='auto'/'fallback'."
                 )
+            if not x.is_cuda:
+                self.last_route = "fallback_cpu_bootstrap"
+                return self.fallback(x)
             self.last_route = "selective"
             return self.selective(x)
 
@@ -274,7 +276,7 @@ class SS2DAuto(nn.Module):
         if self.mode != "auto":
             raise ValueError(f"Unsupported SS2D mode: {self.mode}")
 
-        if self.has_backend:
+        if self.has_backend and x.is_cuda:
             self.last_route = "selective"
             return self.selective(x)
 
@@ -379,6 +381,23 @@ class LLDHigh(nn.Module):
         # Use functional conv2d with the fixed buffer
         high_edge = F.conv2d(f_raw, self.gabor_kernel, padding=1, groups=f_raw.shape[1])
         return self.fusion(torch.cat([high_res, high_edge], dim=1))
+
+
+class LLDHigh_noGabor(nn.Module):
+    """Ablation high-frequency branch using only Laplacian residual H = F - L."""
+
+    def __init__(self, c1: int | list[int]):
+        super().__init__()
+        _ = c1  # keep constructor compatible with parse_model convention
+
+    def forward(self, xs: list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        if not isinstance(xs, (list, tuple)) or len(xs) != 2:
+            raise ValueError("LLDHigh_noGabor expects [F, L] as input.")
+
+        f_raw, f_low = xs
+        if f_low.shape[-2:] != f_raw.shape[-2:]:
+            f_low = F.interpolate(f_low, size=f_raw.shape[-2:], mode="bilinear", align_corners=False)
+        return f_raw - f_low
 
 
 class LowAggP5(nn.Module):

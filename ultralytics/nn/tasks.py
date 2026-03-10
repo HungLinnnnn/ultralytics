@@ -58,6 +58,7 @@ from ultralytics.nn.modules import (
     BDFWarpUp,
     GateConcat,
     LLDHigh,
+    LLDHigh_noGabor,
     LLDLow,
     LowAggP5,
     MambaCM,
@@ -1659,7 +1660,7 @@ def parse_model(d, ch, verbose=True):
             k = args[0] if args else 3
             args = [c1, k]
             c2 = c1
-        elif m is LLDHigh:
+        elif m in {LLDHigh, LLDHigh_noGabor}:
             c2 = ch[f[0]] if isinstance(f, list) else ch[f]
             args = [c2]
         elif m is LowAggP5:

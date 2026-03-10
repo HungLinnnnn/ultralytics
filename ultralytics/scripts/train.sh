@@ -8,6 +8,10 @@ PROJECT=DSB2018_stardist
 #   --src /home/r13922151/cell_datasets/dataset/dsb2018/stardist \
 #   --dst /home/r13922151/cell_datasets/dataset/dsb2018/stardist_yolo \
 #   --splits train test --image-link-mode symlink --overwrite
+#
+# Optional: build selective-scan backend (for Mamba-YOLO SS2D selective path)
+# cd /home/r13922151/Mamba-YOLO/selective_scan
+# /home/r13922151/miniconda3/envs/yolo-ssm/bin/pip install -e .
 
 # CUDA_VISIBLE_DEVICES=1 \
 # yolo segment train \
@@ -31,13 +35,13 @@ PROJECT=DSB2018_stardist
 #     seg_metric_backend=native seg_metric_legacy_pq_reduce=imagewise \
 #     patience=250
 
-CUDA_VISIBLE_DEVICES=3 \
+CUDA_VISIBLE_DEVICES=1 \
 yolo segment train \
-    model=ultralytics/cfg/models/v8/yolov8-seg-ssm-pan/alphainit0.yaml \
+    model=ultralytics/cfg/models/v8/yolov8-seg-ssm-pan/alphainit0_2_noGabor.yaml \
     data=$DATA \
-    batch=128 epochs=1000 device=3 \
+    batch=128 epochs=1000 device=1 \
     pretrained=yolov8n-seg.pt \
-    project=$PROJECT name=alpheInit0 \
+    project=$PROJECT name=alpheInit0.2_noGabor_fallback \
     seg_metric_backend=native seg_metric_legacy_pq_reduce=imagewise \
     patience=300
 
