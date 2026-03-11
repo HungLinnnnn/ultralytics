@@ -35,15 +35,25 @@ PROJECT=DSB2018_stardist
 #     seg_metric_backend=native seg_metric_legacy_pq_reduce=imagewise \
 #     patience=250
 
-CUDA_VISIBLE_DEVICES=1 \
+CUDA_VISIBLE_DEVICES=2 \
 yolo segment train \
     model=ultralytics/cfg/models/v8/yolov8-seg-ssm-pan/alphainit0_2_noGabor.yaml \
     data=$DATA \
-    batch=128 epochs=1000 device=1 \
+    batch=128 epochs=1000 device=2 \
     pretrained=yolov8n-seg.pt \
-    project=$PROJECT name=alpheInit0.2_noGabor_fallback \
+    project=$PROJECT name=alpheInit0.0_offset2.0_noGabor_fallback \
     seg_metric_backend=native seg_metric_legacy_pq_reduce=imagewise \
     patience=300
+
+# CUDA_VISIBLE_DEVICES=2 \
+# yolo segment train \
+#     model=ultralytics/cfg/models/v8/yolov8-seg-ssm-pan/alphainit0_2_stageA.yaml \
+#     data=$DATA \
+#     batch=128 epochs=1000 device=2 \
+#     pretrained=yolov8n-seg.pt \
+#     project=$PROJECT name=alpheInit0.2_stageA_noGabor_fallback \
+#     seg_metric_backend=native seg_metric_legacy_pq_reduce=imagewise \
+#     patience=300
 
 
 # Optional segmentation metric backend switch examples:

@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from ultralytics.nn.modules.ssm_loss import SSMLoss
-from ultralytics.nn.modules.ssmnet_pan import BDFWarpUp
+from ultralytics.nn.modules.ssmnet_pan import BDFWarpUp, PBDFWarpUp
 
 from ultralytics.utils.metrics import OKS_SIGMA, RLE_WEIGHT
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
@@ -478,7 +478,7 @@ class v8SegmentationLoss(v8DetectionLoss):
         super().__init__(model, tal_topk, tal_topk2)
         self.overlap = model.args.overlap_mask
         self.bcedice_loss = BCEDiceLoss(weight_bce=0.5, weight_dice=0.5)
-        self.bdf_modules = [m for m in model.modules() if isinstance(m, BDFWarpUp)]
+        self.bdf_modules = [m for m in model.modules() if isinstance(m, (BDFWarpUp, PBDFWarpUp))]
         self.ssm_loss = SSMLoss(weight=0.1)
 
     def loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:

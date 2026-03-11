@@ -62,7 +62,9 @@ from ultralytics.nn.modules import (
     LLDLow,
     LowAggP5,
     MambaCM,
+    PBDFWarpUp,
     SGF,
+    SGFR,
     Pose,
     Pose26,
     RepC3,
@@ -1688,7 +1690,23 @@ def parse_model(d, ch, verbose=True):
             align_corners = args[1] if len(args) > 1 else False
             args = [c_src, c_high, c_low, max_offset, align_corners]
             c2 = c_src
+        elif m is PBDFWarpUp:
+            c_src = ch[f[0]]
+            c_high = ch[f[1]]
+            c_low = ch[f[2]] if len(f) > 2 else 0
+            max_offset = args[0] if args else 2.0
+            align_corners = args[1] if len(args) > 1 else False
+            args = [c_src, c_high, c_low, max_offset, align_corners]
+            c2 = c_src
         elif m is SGF:
+            c_m, c_b, c_e = ch[f[0]], ch[f[1]], ch[f[2]]
+            c_out = args[0] if args else c_m
+            c_out = make_divisible(min(c_out, max_channels) * width, 8)
+            residual = args[1] if len(args) > 1 else True
+            alpha_init = args[2] if len(args) > 2 else 0.0
+            args = [c_m, c_b, c_e, c_out, residual, alpha_init]
+            c2 = c_out
+        elif m is SGFR:
             c_m, c_b, c_e = ch[f[0]], ch[f[1]], ch[f[2]]
             c_out = args[0] if args else c_m
             c_out = make_divisible(min(c_out, max_channels) * width, 8)

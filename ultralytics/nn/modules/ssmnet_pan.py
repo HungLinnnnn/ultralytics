@@ -17,7 +17,9 @@ __all__ = (
     "LowAggP5",
     "MambaCM",
     "BDFWarpUp",
+    "PBDFWarpUp",
     "SGF",
+    "SGFR",
     "GateConcat",
 )
 
@@ -539,6 +541,106 @@ class BDFWarpUp(nn.Module):
         return aligned
 
 
+class PBDFWarpUp(nn.Module):
+    """Stage-A decoupled warp-up: warp high-frequency only, then restore details."""
+
+    def __init__(
+        self,
+        c_src: int,
+        c_high: int,
+        c_low: int = 0,
+        max_offset: float = 2.0,
+        align_corners: bool = False,
+    ):
+        super().__init__()
+        self.max_offset = float(max_offset)
+        self.align_corners = align_corners
+
+        self.src_proj = nn.Conv2d(c_src, c_high, kernel_size=1, stride=1, padding=0, bias=False)
+        self.low_proj = nn.Conv2d(c_low, c_high, kernel_size=1, stride=1, padding=0, bias=False) if c_low > 0 else None
+
+        c_in = c_high * 2 + (c_high if c_low > 0 else 0)
+        hidden = max(c_high, 16)
+        self.offset_net = nn.Sequential(
+            nn.Conv2d(c_in, hidden, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.SiLU(),
+            nn.Conv2d(hidden, 2, kernel_size=3, stride=1, padding=1, bias=True),
+        )
+        last = self.offset_net[-1]
+        nn.init.zeros_(last.weight)
+        nn.init.zeros_(last.bias)
+
+        self.high_to_src = nn.Conv2d(c_high, c_src, kernel_size=1, stride=1, padding=0, bias=False)
+        restore_hidden = max(c_src // 2, 16)
+        self.restore = nn.Sequential(
+            nn.Conv2d(c_src * 2, restore_hidden, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.SiLU(),
+            nn.Conv2d(restore_hidden, c_src, kernel_size=3, stride=1, padding=1, bias=True),
+        )
+        self.beta = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
+        self.last_offset: torch.Tensor | None = None
+
+    @staticmethod
+    def _build_base_grid(batch: int, h: int, w: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        y = torch.linspace(-1.0, 1.0, steps=h, device=device, dtype=dtype)
+        x = torch.linspace(-1.0, 1.0, steps=w, device=device, dtype=dtype)
+        gy, gx = torch.meshgrid(y, x, indexing="ij")
+        grid = torch.stack((gx, gy), dim=-1)
+        return grid.unsqueeze(0).expand(batch, h, w, 2)
+
+    @staticmethod
+    def _fixed_lowpass(x: torch.Tensor) -> torch.Tensor:
+        return F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, xs: list[torch.Tensor] | tuple[torch.Tensor, ...]) -> torch.Tensor:
+        if not isinstance(xs, (list, tuple)) or len(xs) < 2:
+            raise ValueError("PBDFWarpUp expects [src, high_t, low_t(optional)] as input.")
+
+        src = xs[0]
+        high_t = xs[1]
+        low_t = xs[2] if len(xs) > 2 else None
+        target_size = high_t.shape[-2:]
+        src_up = F.interpolate(src, size=target_size, mode="bilinear", align_corners=self.align_corners)
+
+        feat = [high_t, self.src_proj(src_up)]
+        if self.low_proj is not None and low_t is not None:
+            if low_t.shape[-2:] != target_size:
+                low_t = F.interpolate(low_t, size=target_size, mode="bilinear", align_corners=self.align_corners)
+            feat.append(self.low_proj(low_t))
+
+        offset_raw = self.offset_net(torch.cat(feat, dim=1))
+        offset = self.max_offset * torch.tanh(offset_raw)
+
+        b, _, h, w = offset.shape
+        base_grid = self._build_base_grid(b, h, w, offset.device, offset.dtype)
+        if w > 1:
+            offset_x = offset[:, 0] * (2.0 / (w - 1))
+        else:
+            offset_x = torch.zeros_like(offset[:, 0])
+        if h > 1:
+            offset_y = offset[:, 1] * (2.0 / (h - 1))
+        else:
+            offset_y = torch.zeros_like(offset[:, 1])
+        norm_offset = torch.stack((offset_x, offset_y), dim=-1)
+        grid = base_grid + norm_offset
+
+        src_l = self._fixed_lowpass(src_up)
+        src_h = src_up - src_l
+        warped_h = F.grid_sample(src_h, grid, mode="bilinear", padding_mode="border", align_corners=self.align_corners)
+
+        high_t_src = self.high_to_src(high_t)
+        if high_t_src.shape[-2:] != warped_h.shape[-2:]:
+            high_t_src = F.interpolate(high_t_src, size=warped_h.shape[-2:], mode="bilinear", align_corners=False)
+        h_res = self.restore(torch.cat((warped_h, high_t_src), dim=1))
+        h_refine = warped_h + self.beta * h_res
+        aligned = src_l + h_refine
+
+        self.last_offset = offset
+        if self.training:
+            return aligned, offset
+        return aligned
+
+
 class SGF(nn.Module):
     """Spectral Gated Fusion with residual safety path."""
 
@@ -575,6 +677,43 @@ class SGF(nn.Module):
         m_prime = m * w_e
         fused = self.fuse(torch.cat((m_prime, b_prime), dim=1))
 
+        if self.residual:
+            return self.skip(m) + self.alpha * fused
+        return fused
+
+
+class SGFR(nn.Module):
+    """Stage-A residual-safe spectral fusion (independent from SGF for ablation)."""
+
+    def __init__(self, c_m: int, c_b: int, c_e: int, c_out: int, residual: bool = True, alpha_init: float = 0.0):
+        super().__init__()
+        self.residual = bool(residual)
+
+        self.m_gate = nn.Conv2d(c_m, 1, kernel_size=1, stride=1, padding=0, bias=True)
+        self.e_gate = nn.Conv2d(c_e, 1, kernel_size=1, stride=1, padding=0, bias=True)
+        self.fuse = nn.Conv2d(c_m + c_b, c_out, kernel_size=1, stride=1, padding=0, bias=False)
+        self.skip = nn.Conv2d(c_m, c_out, kernel_size=1, stride=1, padding=0, bias=False) if c_m != c_out else nn.Identity()
+        self.alpha = nn.Parameter(torch.ones(1, c_out, 1, 1) * alpha_init)
+
+    def forward(self, xs: list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        if not isinstance(xs, (list, tuple)) or len(xs) != 3:
+            raise ValueError("SGFR expects [M, B, E] as input.")
+
+        m, b, e = xs
+        if isinstance(m, (list, tuple)):
+            m = m[0]
+        target_size = m.shape[-2:]
+        if b.shape[-2:] != target_size:
+            b = F.interpolate(b, size=target_size, mode="bilinear", align_corners=False)
+        if e.shape[-2:] != target_size:
+            e = F.interpolate(e, size=target_size, mode="bilinear", align_corners=False)
+
+        w_m = torch.sigmoid(self.m_gate(m))
+        w_e = 1.0 + torch.tanh(self.e_gate(e))
+
+        b_prime = b * w_m
+        m_prime = m * w_e
+        fused = self.fuse(torch.cat((m_prime, b_prime), dim=1))
         if self.residual:
             return self.skip(m) + self.alpha * fused
         return fused
