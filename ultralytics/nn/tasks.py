@@ -62,6 +62,7 @@ from ultralytics.nn.modules import (
     LLDLow,
     LowAggP5,
     MambaCM,
+    PGBDFWarpUp,
     PBDFWarpUp,
     SGF,
     SGFR,
@@ -1698,6 +1699,42 @@ def parse_model(d, ch, verbose=True):
             align_corners = args[1] if len(args) > 1 else False
             args = [c_src, c_high, c_low, max_offset, align_corners]
             c2 = c_src
+        elif m is PGBDFWarpUp:
+            c_src = ch[f[0]]
+            c_high = ch[f[1]]
+            c_low = ch[f[2]] if len(f) > 2 else 0
+            cp = args[0] if len(args) > 0 else 32
+            num_orient = args[1] if len(args) > 1 else 4
+            k_phase = args[2] if len(args) > 2 else 5
+            max_offset = args[3] if len(args) > 3 else 2.0
+            align_corners = args[4] if len(args) > 4 else False
+            use_phase = args[5] if len(args) > 5 else True
+            use_amp = args[6] if len(args) > 6 else True
+            beta_init = args[7] if len(args) > 7 else 0.1
+            phase_energy_thresh = args[8] if len(args) > 8 else 1e-6
+            response_clip = args[9] if len(args) > 9 else 10.0
+            phase_eps = args[10] if len(args) > 10 else 1e-6
+            conf_clip = args[11] if len(args) > 11 else 5.0
+            debug_phase = args[12] if len(args) > 12 else False
+            args = [
+                c_src,
+                c_high,
+                c_low,
+                cp,
+                num_orient,
+                k_phase,
+                max_offset,
+                align_corners,
+                use_phase,
+                use_amp,
+                beta_init,
+                phase_energy_thresh,
+                response_clip,
+                phase_eps,
+                conf_clip,
+                debug_phase,
+            ]
+            c2 = c_src
         elif m is SGF:
             c_m, c_b, c_e = ch[f[0]], ch[f[1]], ch[f[2]]
             c_out = args[0] if args else c_m
@@ -1804,7 +1841,8 @@ def yaml_model_load(path):
     unified_path = re.sub(r"(\d+)([nslmx])(.+)?$", r"\1\3", str(path))  # i.e. yolov8x.yaml -> yolov8.yaml
     yaml_file = check_yaml(unified_path, hard=False) or check_yaml(path)
     d = YAML.load(yaml_file)  # model dict
-    d["scale"] = guess_model_scale(path)
+    # Respect explicit scale in YAML; only fall back to filename-derived scale when missing.
+    d["scale"] = d.get("scale") or guess_model_scale(path)
     d["yaml_file"] = str(path)
     return d
 

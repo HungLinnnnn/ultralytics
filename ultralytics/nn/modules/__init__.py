@@ -113,7 +113,9 @@ from .ssmnet_pan import (
     LLDLow,
     LowAggP5,
     MambaCM,
+    PGBDFWarpUp,
     PBDFWarpUp,
+    PhaseFilterBank,
     SGF,
     SGFR,
 )
@@ -179,6 +181,8 @@ __all__ = (
     "LowAggP5",
     "MambaCM",
     "BDFWarpUp",
+    "PhaseFilterBank",
+    "PGBDFWarpUp",
     "PBDFWarpUp",
     "SGF",
     "SGFR",

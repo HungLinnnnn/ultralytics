@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import math
 import torch
 import torch.nn as nn
@@ -17,6 +18,8 @@ __all__ = (
     "LowAggP5",
     "MambaCM",
     "BDFWarpUp",
+    "PhaseFilterBank",
+    "PGBDFWarpUp",
     "PBDFWarpUp",
     "SGF",
     "SGFR",
@@ -538,6 +541,404 @@ class BDFWarpUp(nn.Module):
 
         if self.training:
             return aligned, offset
+        return aligned
+
+
+class PhaseFilterBank(nn.Module):
+    """Fixed complex orientation filter bank for extracting phase and amplitude cues."""
+
+    def __init__(
+        self,
+        cp: int,
+        num_orient: int = 4,
+        k_phase: int = 5,
+        sigma: float = 1.5,
+        wavelength: float = 3.0,
+        gamma: float = 0.5,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        if cp <= 0:
+            raise ValueError(f"PhaseFilterBank expects cp > 0, got {cp}.")
+        if num_orient <= 0:
+            raise ValueError(f"PhaseFilterBank expects num_orient > 0, got {num_orient}.")
+        if k_phase % 2 == 0:
+            raise ValueError(f"PhaseFilterBank expects odd k_phase, got {k_phase}.")
+
+        self.cp = int(cp)
+        self.num_orient = int(num_orient)
+        self.k_phase = int(k_phase)
+        self.eps = float(eps)
+
+        real_bank, imag_bank = self._build_filter_bank(self.cp, self.num_orient, self.k_phase, sigma, wavelength, gamma)
+        self.register_buffer("real_bank", real_bank)
+        self.register_buffer("imag_bank", imag_bank)
+
+    @staticmethod
+    def _build_single_kernel(
+        k: int,
+        theta: float,
+        sigma: float,
+        wavelength: float,
+        gamma: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        d = k // 2
+        coords = torch.arange(-d, d + 1, dtype=torch.float32)
+        yy, xx = torch.meshgrid(coords, coords, indexing="ij")
+
+        x_prime = xx * math.cos(theta) + yy * math.sin(theta)
+        y_prime = -xx * math.sin(theta) + yy * math.cos(theta)
+        envelope = torch.exp(-(x_prime.pow(2) + (gamma**2) * y_prime.pow(2)) / (2 * (sigma**2)))
+
+        real = envelope * torch.cos((2 * math.pi * x_prime) / wavelength)
+        imag = envelope * torch.sin((2 * math.pi * x_prime) / wavelength)
+
+        real = real - real.mean()
+        imag = imag - imag.mean()
+        real = real / (real.pow(2).sum().sqrt() + 1e-6)
+        imag = imag / (imag.pow(2).sum().sqrt() + 1e-6)
+        return real, imag
+
+    @classmethod
+    def _build_filter_bank(
+        cls,
+        cp: int,
+        num_orient: int,
+        k_phase: int,
+        sigma: float,
+        wavelength: float,
+        gamma: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        real_bank = torch.zeros((num_orient, cp, 1, k_phase, k_phase), dtype=torch.float32)
+        imag_bank = torch.zeros((num_orient, cp, 1, k_phase, k_phase), dtype=torch.float32)
+        for m in range(num_orient):
+            theta = (math.pi * m) / num_orient
+            real, imag = cls._build_single_kernel(k_phase, theta, sigma, wavelength, gamma)
+            real_bank[m, :, 0] = real
+            imag_bank[m, :, 0] = imag
+        return real_bank, imag_bank
+
+    def forward(self, ht_proj: torch.Tensor, hs_proj: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if ht_proj.shape != hs_proj.shape:
+            raise ValueError(
+                f"PhaseFilterBank expects ht_proj and hs_proj with identical shape, got {ht_proj.shape} vs {hs_proj.shape}."
+            )
+        if ht_proj.shape[1] != self.cp:
+            raise ValueError(f"PhaseFilterBank expects channel={self.cp}, got {ht_proj.shape[1]}.")
+
+        phase_feats = []
+        amp_t_feats = []
+        amp_s_feats = []
+        pad = self.k_phase // 2
+        for m in range(self.num_orient):
+            real_kernel = self.real_bank[m].to(dtype=ht_proj.dtype)
+            imag_kernel = self.imag_bank[m].to(dtype=ht_proj.dtype)
+
+            rt = F.conv2d(ht_proj, real_kernel, stride=1, padding=pad, groups=self.cp)
+            it = F.conv2d(ht_proj, imag_kernel, stride=1, padding=pad, groups=self.cp)
+            rs = F.conv2d(hs_proj, real_kernel, stride=1, padding=pad, groups=self.cp)
+            is_ = F.conv2d(hs_proj, imag_kernel, stride=1, padding=pad, groups=self.cp)
+
+            amp_t = torch.sqrt(rt.pow(2) + it.pow(2) + self.eps)
+            amp_s = torch.sqrt(rs.pow(2) + is_.pow(2) + self.eps)
+
+            phi_t = torch.atan2(it, rt)
+            phi_s = torch.atan2(is_, rs)
+            dphi = torch.atan2(torch.sin(phi_t - phi_s), torch.cos(phi_t - phi_s))
+
+            phase_feats.append(dphi)
+            amp_t_feats.append(amp_t)
+            amp_s_feats.append(amp_s)
+
+        return torch.cat(phase_feats, dim=1), torch.cat(amp_t_feats, dim=1), torch.cat(amp_s_feats, dim=1)
+
+
+class PGBDFWarpUp(nn.Module):
+    """Phase-guided decoupled warp-up with high-frequency-only warping and restore."""
+
+    def __init__(
+        self,
+        c_src: int,
+        c_high: int,
+        c_low: int = 0,
+        cp: int = 32,
+        num_orient: int = 4,
+        k_phase: int = 5,
+        max_offset: float = 2.0,
+        align_corners: bool = False,
+        use_phase: bool = True,
+        use_amp: bool = True,
+        beta_init: float = 0.1,
+        phase_energy_thresh: float = 1e-6,
+        response_clip: float = 10.0,
+        phase_eps: float = 1e-6,
+        conf_clip: float = 5.0,
+        debug_phase: bool = False,
+        debug_phase_interval: int = 200,
+        debug_phase_warmup: int = 5,
+    ):
+        super().__init__()
+        self.max_offset = float(max_offset)
+        self.align_corners = bool(align_corners)
+        self.use_phase = bool(use_phase)
+        self.use_amp = bool(use_amp)
+        self.cp = max(int(cp), 1)
+        self.num_orient = max(int(num_orient), 1)
+        self.phase_energy_thresh = float(phase_energy_thresh)
+        self.response_clip = float(response_clip)
+        self.phase_eps = float(phase_eps)
+        self.conf_clip = float(conf_clip)
+        self.debug_phase = bool(debug_phase)
+        self.debug_phase_interval = max(int(debug_phase_interval), 1)
+        self.debug_phase_warmup = max(int(debug_phase_warmup), 0)
+        self._debug_phase_counter = 0
+
+        self.high_t_proj = nn.Conv2d(c_high, self.cp, kernel_size=1, stride=1, padding=0, bias=False)
+        self.high_s_proj = nn.Conv2d(c_src, self.cp, kernel_size=1, stride=1, padding=0, bias=False)
+        self.src_proj = nn.Conv2d(c_src, self.cp, kernel_size=1, stride=1, padding=0, bias=False)
+        self.low_proj = nn.Conv2d(c_low, self.cp, kernel_size=1, stride=1, padding=0, bias=False) if c_low > 0 else None
+
+        self.phase_bank = PhaseFilterBank(cp=self.cp, num_orient=self.num_orient, k_phase=int(k_phase))
+        phase_ch = self.cp * self.num_orient
+
+        c_in = self.cp * 3 + (self.cp if c_low > 0 else 0)
+        if self.use_phase:
+            c_in += phase_ch
+        if self.use_amp:
+            c_in += 2 * phase_ch
+
+        hidden = max(self.cp * 2, 32)
+        self.offset_net = nn.Sequential(
+            nn.Conv2d(c_in, hidden, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.SiLU(),
+            nn.Conv2d(hidden, hidden, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.SiLU(),
+            nn.Conv2d(hidden, 2, kernel_size=3, stride=1, padding=1, bias=True),
+        )
+        last = self.offset_net[-1]
+        nn.init.zeros_(last.weight)
+        nn.init.zeros_(last.bias)
+
+        self.high_to_src = nn.Conv2d(c_high, c_src, kernel_size=1, stride=1, padding=0, bias=False)
+        restore_hidden = max(c_src // 2, 16)
+        self.restore = nn.Sequential(
+            nn.Conv2d(c_src * 2, restore_hidden, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.SiLU(),
+            nn.Conv2d(restore_hidden, c_src, kernel_size=3, stride=1, padding=1, bias=True),
+        )
+        self.beta = nn.Parameter(torch.tensor(float(beta_init), dtype=torch.float32))
+        self.last_offset: torch.Tensor | None = None
+
+    @staticmethod
+    def _build_base_grid(batch: int, h: int, w: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        y = torch.linspace(-1.0, 1.0, steps=h, device=device, dtype=dtype)
+        x = torch.linspace(-1.0, 1.0, steps=w, device=device, dtype=dtype)
+        gy, gx = torch.meshgrid(y, x, indexing="ij")
+        grid = torch.stack((gx, gy), dim=-1)
+        return grid.unsqueeze(0).expand(batch, h, w, 2)
+
+    @staticmethod
+    def _fixed_lowpass(x: torch.Tensor) -> torch.Tensor:
+        return F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
+
+    def _check_finite(self, name: str, x: torch.Tensor) -> None:
+        if self.debug_phase and not torch.isfinite(x).all():
+            raise RuntimeError(f"{self.__class__.__name__}: non-finite tensor detected in {name}.")
+
+    def _maybe_log_phase_stats(
+        self,
+        phase_feats: torch.Tensor | None,
+        amp_t_feats: torch.Tensor | None,
+        amp_s_feats: torch.Tensor | None,
+        conf_feats: torch.Tensor | None,
+        delta_p: torch.Tensor,
+    ) -> None:
+        if not self.debug_phase:
+            return
+        self._debug_phase_counter += 1
+        step = self._debug_phase_counter
+        should_log = step <= self.debug_phase_warmup or step % self.debug_phase_interval == 0
+        if not should_log:
+            return
+
+        def _stats(x: torch.Tensor) -> tuple[float, float, float, float]:
+            xd = x.detach()
+            return float(xd.mean()), float(xd.std()), float(xd.min()), float(xd.max())
+
+        msg = [
+            f"[{self.__class__.__name__}] debug_step={step}",
+            f"delta_p_abs_mean={float(delta_p.detach().abs().mean()):.6f}",
+            f"delta_p_abs_max={float(delta_p.detach().abs().max()):.6f}",
+        ]
+        if phase_feats is not None:
+            m, s, mn, mx = _stats(phase_feats)
+            msg.append(f"phase(mean/std/min/max)=({m:.6f}/{s:.6f}/{mn:.6f}/{mx:.6f})")
+        if amp_t_feats is not None:
+            m, s, mn, mx = _stats(amp_t_feats)
+            msg.append(f"amp_t(mean/std/min/max)=({m:.6f}/{s:.6f}/{mn:.6f}/{mx:.6f})")
+        if amp_s_feats is not None:
+            m, s, mn, mx = _stats(amp_s_feats)
+            msg.append(f"amp_s(mean/std/min/max)=({m:.6f}/{s:.6f}/{mn:.6f}/{mx:.6f})")
+        if conf_feats is not None:
+            m, s, mn, mx = _stats(conf_feats)
+            msg.append(f"conf(mean/std/min/max)=({m:.6f}/{s:.6f}/{mn:.6f}/{mx:.6f})")
+        print(" ".join(msg))
+
+    def _compute_phase_amp_safe(
+        self, ht_proj: torch.Tensor, hs_proj: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if ht_proj.shape != hs_proj.shape:
+            raise ValueError(
+                f"PGBDFWarpUp expects ht_proj and hs_proj with identical shape, got {ht_proj.shape} vs {hs_proj.shape}."
+            )
+        if ht_proj.shape[1] != self.cp:
+            raise ValueError(f"PGBDFWarpUp expects projected channel={self.cp}, got {ht_proj.shape[1]}.")
+
+        orig_dtype = ht_proj.dtype
+        ht = ht_proj.float()
+        hs = hs_proj.float()
+
+        phase_feats = []
+        amp_t_feats = []
+        amp_s_feats = []
+        conf_feats = []
+        pad = self.phase_bank.k_phase // 2
+        amp_ctx = torch.autocast(device_type=ht.device.type, enabled=False) if ht.device.type in {"cuda", "cpu"} else nullcontext()
+
+        with amp_ctx:
+            for m in range(self.num_orient):
+                real_kernel = self.phase_bank.real_bank[m].to(device=ht.device, dtype=torch.float32)
+                imag_kernel = self.phase_bank.imag_bank[m].to(device=ht.device, dtype=torch.float32)
+
+                rt = F.conv2d(ht, real_kernel, stride=1, padding=pad, groups=self.cp)
+                it = F.conv2d(ht, imag_kernel, stride=1, padding=pad, groups=self.cp)
+                rs = F.conv2d(hs, real_kernel, stride=1, padding=pad, groups=self.cp)
+                is_ = F.conv2d(hs, imag_kernel, stride=1, padding=pad, groups=self.cp)
+
+                if self.response_clip > 0:
+                    rt = rt.clamp(min=-self.response_clip, max=self.response_clip)
+                    it = it.clamp(min=-self.response_clip, max=self.response_clip)
+                    rs = rs.clamp(min=-self.response_clip, max=self.response_clip)
+                    is_ = is_.clamp(min=-self.response_clip, max=self.response_clip)
+
+                mag_t = rt.pow(2) + it.pow(2)
+                mag_s = rs.pow(2) + is_.pow(2)
+                valid = (mag_t > self.phase_energy_thresh) & (mag_s > self.phase_energy_thresh)
+
+                amp_t = torch.sqrt(mag_t + self.phase_eps)
+                amp_s = torch.sqrt(mag_s + self.phase_eps)
+
+                phi_t = torch.atan2(it, rt)
+                phi_s = torch.atan2(is_, rs)
+                dphi = torch.atan2(torch.sin(phi_t - phi_s), torch.cos(phi_t - phi_s))
+                dphi = torch.where(valid, dphi, torch.zeros_like(dphi))
+                dphi = dphi.clamp(min=-math.pi, max=math.pi)
+
+                valid_f = valid.to(dtype=torch.float32)
+                conf = torch.minimum(amp_t, amp_s) * valid_f
+                conf_mean = conf.sum(dim=(1, 2, 3), keepdim=True) / (valid_f.sum(dim=(1, 2, 3), keepdim=True) + self.phase_eps)
+                conf = conf / (conf_mean + self.phase_eps)
+                conf = conf.clamp(min=0.0, max=self.conf_clip)
+
+                phase_feats.append(dphi)
+                amp_t_feats.append(amp_t)
+                amp_s_feats.append(amp_s)
+                conf_feats.append(conf)
+
+            phase_feats = torch.cat(phase_feats, dim=1)
+            amp_t_feats = torch.cat(amp_t_feats, dim=1)
+            amp_s_feats = torch.cat(amp_s_feats, dim=1)
+            conf_feats = torch.cat(conf_feats, dim=1)
+            amp_cap = math.sqrt(2.0) * self.response_clip if self.response_clip > 0 else 20.0
+            phase_feats = torch.nan_to_num(phase_feats, nan=0.0, posinf=math.pi, neginf=-math.pi).clamp(-math.pi, math.pi)
+            amp_t_feats = torch.nan_to_num(amp_t_feats, nan=0.0, posinf=amp_cap, neginf=0.0).clamp(0.0, amp_cap)
+            amp_s_feats = torch.nan_to_num(amp_s_feats, nan=0.0, posinf=amp_cap, neginf=0.0).clamp(0.0, amp_cap)
+            conf_feats = torch.nan_to_num(conf_feats, nan=0.0, posinf=self.conf_clip, neginf=0.0).clamp(0.0, self.conf_clip)
+
+        self._check_finite("phase_feats", phase_feats)
+        self._check_finite("amp_t_feats", amp_t_feats)
+        self._check_finite("amp_s_feats", amp_s_feats)
+        self._check_finite("conf_feats", conf_feats)
+
+        return (
+            phase_feats.to(orig_dtype),
+            amp_t_feats.to(orig_dtype),
+            amp_s_feats.to(orig_dtype),
+            conf_feats.to(orig_dtype),
+        )
+
+    def forward(self, xs: list[torch.Tensor] | tuple[torch.Tensor, ...]) -> torch.Tensor:
+        if not isinstance(xs, (list, tuple)) or len(xs) < 2:
+            raise ValueError("PGBDFWarpUp expects [src, high_t, low_t(optional)] as input.")
+
+        src = xs[0]
+        high_t = xs[1]
+        low_t = xs[2] if len(xs) > 2 else None
+        target_size = high_t.shape[-2:]
+
+        src_up = F.interpolate(src, size=target_size, mode="bilinear", align_corners=self.align_corners)
+        src_l = self._fixed_lowpass(src_up)
+        src_h = src_up - src_l
+
+        ht_proj = self.high_t_proj(high_t)
+        hs_proj = self.high_s_proj(src_h)
+        src_proj = self.src_proj(src_up)
+
+        feat = [ht_proj, hs_proj, src_proj]
+        if self.low_proj is not None and low_t is not None:
+            if low_t.shape[-2:] != target_size:
+                low_t = F.interpolate(low_t, size=target_size, mode="bilinear", align_corners=self.align_corners)
+            feat.append(self.low_proj(low_t))
+
+        phase_feats = None
+        amp_t_feats = None
+        amp_s_feats = None
+        conf_feats = None
+        if self.use_phase or self.use_amp:
+            phase_feats, amp_t_feats, amp_s_feats, conf_feats = self._compute_phase_amp_safe(ht_proj, hs_proj)
+            if self.use_phase:
+                if self.use_amp:
+                    feat.append(phase_feats * conf_feats)
+                else:
+                    feat.append(phase_feats)
+            if self.use_amp:
+                feat.extend((amp_t_feats, amp_s_feats))
+
+        offset_in = torch.cat(feat, dim=1)
+        offset_in = torch.nan_to_num(offset_in, nan=0.0, posinf=1e4, neginf=-1e4)
+        offset_raw = self.offset_net(offset_in)
+        offset_raw = torch.nan_to_num(offset_raw, nan=0.0, posinf=50.0, neginf=-50.0)
+        self._check_finite("offset_raw", offset_raw)
+        delta_p = self.max_offset * torch.tanh(offset_raw)
+        self._check_finite("delta_p", delta_p)
+
+        b, _, h, w = delta_p.shape
+        base_grid = self._build_base_grid(b, h, w, delta_p.device, delta_p.dtype)
+        if w > 1:
+            offset_x = delta_p[:, 0] * (2.0 / (w - 1))
+        else:
+            offset_x = torch.zeros_like(delta_p[:, 0])
+        if h > 1:
+            offset_y = delta_p[:, 1] * (2.0 / (h - 1))
+        else:
+            offset_y = torch.zeros_like(delta_p[:, 1])
+        norm_offset = torch.stack((offset_x, offset_y), dim=-1)
+        grid = base_grid + norm_offset
+
+        warped_h = F.grid_sample(src_h, grid, mode="bilinear", padding_mode="border", align_corners=self.align_corners)
+
+        high_t_src = self.high_to_src(high_t)
+        if high_t_src.shape[-2:] != warped_h.shape[-2:]:
+            high_t_src = F.interpolate(high_t_src, size=warped_h.shape[-2:], mode="bilinear", align_corners=False)
+        h_res = self.restore(torch.cat((warped_h, high_t_src), dim=1))
+        h_refine = warped_h + self.beta * h_res
+        aligned = src_l + h_refine
+        aligned = torch.nan_to_num(aligned, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        self._maybe_log_phase_stats(phase_feats, amp_t_feats, amp_s_feats, conf_feats, delta_p)
+        self.last_offset = delta_p
+        if self.training:
+            return aligned, delta_p
         return aligned
 
 
