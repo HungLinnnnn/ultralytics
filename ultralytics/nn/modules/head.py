@@ -20,7 +20,18 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
+__all__ = (
+    "OBB",
+    "Classify",
+    "Detect",
+    "Pose",
+    "RTDETRDecoder",
+    "Segment",
+    "FACZSSegment",
+    "YOLOEDetect",
+    "YOLOESegment",
+    "v10Detect",
+)
 
 
 class Detect(nn.Module):
@@ -348,6 +359,96 @@ class Segment(Detect):
     def fuse(self) -> None:
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = self.cv4 = None
+
+
+class FACZSSegment(Segment):
+    """Contact-aware segmentation head for FA-CZS v1."""
+
+    def __init__(
+        self,
+        nc: int = 80,
+        nm: int = 32,
+        npr: int = 256,
+        contact_channels: int = 128,
+        contact_alpha: float = 0.2,
+        modulation_enabled: bool = True,
+        contact_loss_weight: float = 0.2,
+        reg_max=16,
+        end2end=False,
+        ch: tuple = (),
+    ):
+        """Initialize the FA-CZS v1 head on top of the standard Segment head."""
+        super().__init__(nc, nm, npr, reg_max, end2end, ch)
+        self.contact_channels = max(int(contact_channels), 1)
+        self.contact_alpha = float(contact_alpha)
+        self.modulation_enabled = bool(modulation_enabled)
+        self.contact_loss_weight = float(contact_loss_weight)
+
+        self.contact_reduce_f3 = Conv(ch[0], self.contact_channels, 3)
+        self.contact_reduce_f4 = Conv(ch[1], self.contact_channels, 1, 1)
+        self.contact_fuse = Conv(self.contact_channels * 2, self.contact_channels, 3)
+        self.contact_refine = Conv(self.contact_channels, self.contact_channels, 3)
+        self.contact_upsample = nn.ConvTranspose2d(
+            self.contact_channels, self.contact_channels, 2, 2, 0, bias=True
+        )
+        self.contact_logit_head = nn.Conv2d(self.contact_channels, 1, 1)
+        self.proto_delta_head = nn.Conv2d(self.contact_channels, self.nm, 1)
+
+    def _contact_features(self, x: list[torch.Tensor]) -> torch.Tensor:
+        """Fuse F3 detail with upsampled F4 context before projecting to proto resolution."""
+        f3 = self.contact_reduce_f3(x[0])
+        f4 = F.interpolate(self.contact_reduce_f4(x[1]), size=x[0].shape[-2:], mode="nearest")
+        contact_feat = self.contact_fuse(torch.cat((f3, f4), dim=1))
+        contact_feat = self.contact_refine(contact_feat)
+        return self.contact_upsample(contact_feat)
+
+    def _refine_proto(self, x: list[torch.Tensor], proto_base: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply proto-space contact-aware residual modulation."""
+        contact_feat = self._contact_features(x)
+        if contact_feat.shape[-2:] != proto_base.shape[-2:]:
+            contact_feat = F.interpolate(contact_feat, size=proto_base.shape[-2:], mode="bilinear", align_corners=False)
+        contact_logit = self.contact_logit_head(contact_feat)
+        proto_delta = self.proto_delta_head(contact_feat)
+        alpha = self.contact_alpha if self.modulation_enabled else 0.0
+        proto_ref = proto_base + alpha * contact_logit.sigmoid() * proto_delta
+        return proto_ref, contact_logit, proto_delta
+
+    def forward(self, x: list[torch.Tensor]) -> tuple | list[torch.Tensor] | dict[str, torch.Tensor]:
+        """Return standard segmentation outputs plus contact-aware proto modulation."""
+        outputs = super().forward(x)
+        if self.training:
+            preds = outputs
+            if self.end2end:
+                proto_base = preds["one2many"]["proto"]
+                proto_ref, contact_logit, proto_delta = self._refine_proto(x, proto_base)
+                preds["one2many"]["proto"] = proto_ref
+                preds["one2many"]["contact_logit"] = contact_logit
+                preds["one2many"]["proto_delta"] = proto_delta
+                preds["one2one"]["proto"] = proto_ref.detach()
+                preds["one2one"]["contact_logit"] = contact_logit.detach()
+                preds["one2one"]["proto_delta"] = proto_delta.detach()
+                preds["proto"] = proto_ref
+                preds["contact_logit"] = contact_logit
+                preds["proto_delta"] = proto_delta
+                return preds
+            proto_base = preds["proto"]
+            proto_ref, contact_logit, proto_delta = self._refine_proto(x, proto_base)
+            preds["proto"] = proto_ref
+            preds["contact_logit"] = contact_logit
+            preds["proto_delta"] = proto_delta
+            return preds
+
+        if self.export:
+            det_out, proto_base = outputs
+            proto_ref, _, _ = self._refine_proto(x, proto_base)
+            return det_out, proto_ref
+
+        (det_out, proto_base), preds = outputs
+        proto_ref, contact_logit, proto_delta = self._refine_proto(x, proto_base)
+        preds["proto"] = proto_ref
+        preds["contact_logit"] = contact_logit
+        preds["proto_delta"] = proto_delta
+        return ((det_out, proto_ref), preds)
 
 
 class Segment26(Segment):
