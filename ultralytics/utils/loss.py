@@ -16,6 +16,7 @@ from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import autocast
 
+from .contact_targets import build_contact_targets
 from .metrics import bbox_iou, probiou
 from .tal import bbox2dist, rbox2dist
 
@@ -476,15 +477,23 @@ class v8SegmentationLoss(v8DetectionLoss):
     def __init__(self, model, tal_topk: int = 10, tal_topk2: int | None = None):  # model must be de-paralleled
         """Initialize the v8SegmentationLoss class with model parameters and mask overlap setting."""
         super().__init__(model, tal_topk, tal_topk2)
+        m = model.model[-1]
         self.overlap = model.args.overlap_mask
         self.bcedice_loss = BCEDiceLoss(weight_bce=0.5, weight_dice=0.5)
+        self.contact_bcedice_loss = BCEDiceLoss(weight_bce=0.5, weight_dice=0.5)
+        self.has_contact = hasattr(m, "contact_loss_weight")
+        self.contact_loss_weight = float(getattr(m, "contact_loss_weight", 0.0))
         self.bdf_modules = [m for m in model.modules() if isinstance(m, (BDFWarpUp, PBDFWarpUp, PGBDFWarpUp))]
         self.ssm_loss = SSMLoss(weight=0.1)
 
     def loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate and return the combined loss for detection and segmentation."""
         pred_masks, proto = preds["mask_coefficient"].permute(0, 2, 1).contiguous(), preds["proto"]
-        loss = torch.zeros(5, device=self.device)  # box, seg, cls, dfl
+        pred_contact = preds.get("contact_logit")
+        if self.has_contact and pred_contact is None:
+            raise RuntimeError("FA-CZS head is missing 'contact_logit' in training predictions.")
+
+        loss = torch.zeros(6 if self.has_contact else 5, device=self.device)  # box, seg, cls, dfl, sem, contact
         if isinstance(proto, tuple) and len(proto) == 2:
             proto, pred_semseg = proto
         else:
@@ -539,6 +548,15 @@ class v8SegmentationLoss(v8DetectionLoss):
                 loss[4] += (pred_semseg * 0).sum()
 
         loss[1] *= self.hyp.box  # seg gain
+        if self.has_contact:
+            contact_target = build_contact_targets(
+                masks=batch["masks"].to(self.device).float(),
+                proto_shape=pred_contact.shape[-2:],
+                overlap=self.overlap,
+                batch_idx=batch["batch_idx"].view(-1),
+                batch_size=pred_contact.shape[0],
+            )
+            loss[5] = self.contact_bcedice_loss(pred_contact, contact_target) * self.contact_loss_weight
         total_loss = loss.sum()
         if self.bdf_modules:
             offsets = [m.last_offset for m in self.bdf_modules if m.last_offset is not None]

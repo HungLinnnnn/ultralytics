@@ -77,6 +77,7 @@ from .conv import (
     SpatialAttention,
 )
 from .head import (
+    FACZSSegment,
     OBB,
     OBB26,
     Classify,
@@ -166,6 +167,7 @@ __all__ = (
     "DeformableTransformerDecoder",
     "DeformableTransformerDecoderLayer",
     "Detect",
+    "FACZSSegment",
     "Focus",
     "GhostBottleneck",
     "GhostConv",
