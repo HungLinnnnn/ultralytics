@@ -29,33 +29,56 @@ def _resize_mask(mask: torch.Tensor, proto_shape: tuple[int, int]) -> torch.Tens
     return F.interpolate(mask, size=proto_shape, mode="nearest")
 
 
-def _pairwise_contact_core(
-    instance_masks: list[torch.Tensor],
+def _resize_instance_stack(instance_masks: torch.Tensor, proto_shape: tuple[int, int]) -> torch.Tensor:
+    """Resize a stacked instance-mask tensor to proto resolution."""
+    if instance_masks.shape[-2:] == proto_shape:
+        return instance_masks
+    return F.interpolate(instance_masks.float(), size=proto_shape, mode="nearest")
+
+
+def _vectorized_contact_core(
+    instance_masks: torch.Tensor,
     min_area: float,
     dilation_radius: int,
     large_instance_thresh: float,
     large_instance_radius: int,
 ) -> torch.Tensor | None:
-    """Build a narrow binary contact core from per-instance masks."""
-    processed = []
-    for instance_mask in instance_masks:
-        if float(instance_mask.sum().item()) < min_area:
-            continue
-        radius = large_instance_radius if float(instance_mask.sum().item()) >= large_instance_thresh else dilation_radius
-        binary_mask = (instance_mask > 0.5).float()
-        processed.append((binary_mask, _morph_dilate(binary_mask, radius), _morph_erode(binary_mask, 1)))
-
-    if len(processed) < 2:
+    """Build the union of valid pairwise contact cores without Python-side pair enumeration."""
+    if instance_masks.shape[0] < 2:
         return None
 
-    core = torch.zeros_like(processed[0][0], dtype=torch.bool)
-    for i in range(len(processed)):
-        _, dil_i, erode_i = processed[i]
-        for j in range(i + 1, len(processed)):
-            _, dil_j, erode_j = processed[j]
-            overlap = (dil_i > 0.5) & (dil_j > 0.5)
-            interiors = (erode_i > 0.5) | (erode_j > 0.5)
-            core |= overlap & ~interiors
+    binary_masks = (instance_masks > 0.5).float()
+    areas = binary_masks.sum(dim=(1, 2, 3))
+    valid = areas >= float(min_area)
+    valid_indices = valid.nonzero(as_tuple=False).flatten()
+    if valid_indices.shape[0] < 2:
+        return None
+
+    binary_masks = binary_masks[valid_indices]
+    areas = areas[valid_indices]
+    eroded = _morph_erode(binary_masks, 1) > 0.5
+
+    if int(dilation_radius) == int(large_instance_radius):
+        active_members = (_morph_dilate(binary_masks, int(dilation_radius)) > 0.5) & ~eroded
+    else:
+        small = areas < float(large_instance_thresh)
+        large = ~small
+        active_parts = []
+        if small.any():
+            active_parts.append((_morph_dilate(binary_masks[small], int(dilation_radius)) > 0.5) & ~eroded[small])
+        if large.any():
+            active_parts.append((_morph_dilate(binary_masks[large], int(large_instance_radius)) > 0.5) & ~eroded[large])
+        if len(active_parts) == 1:
+            active_members = active_parts[0]
+        else:
+            active_members = torch.cat(active_parts, dim=0)
+
+    if active_members.shape[0] < 2:
+        return None
+
+    # Equivalent to the original union over valid instance pairs:
+    # a pixel is in the contact core iff at least two instances satisfy D_i & ~E_i there.
+    core = active_members.to(torch.int16).sum(dim=0) >= 2
     return core.float()
 
 
@@ -107,19 +130,19 @@ def build_contact_targets(
     for image_idx in range(inferred_batch):
         if overlap:
             instance_index_mask = masks[image_idx]
-            instance_masks = []
             instance_ids = torch.unique(instance_index_mask.long())
             instance_ids = instance_ids[instance_ids > 0]
-            for instance_id in instance_ids:
-                instance_mask = (instance_index_mask == instance_id).float().unsqueeze(0).unsqueeze(0)
-                instance_masks.append(_resize_mask(instance_mask, proto_shape))
+            if instance_ids.shape[0] < 2:
+                continue
+            instance_masks = (instance_index_mask.unsqueeze(0) == instance_ids[:, None, None]).unsqueeze(1)
+            instance_masks = _resize_instance_stack(instance_masks.float(), proto_shape)
         else:
-            instance_masks = []
             image_instances = masks[batch_idx == image_idx]
-            for instance_mask in image_instances:
-                instance_masks.append(_resize_mask(instance_mask.unsqueeze(0).unsqueeze(0).float(), proto_shape))
+            if image_instances.shape[0] < 2:
+                continue
+            instance_masks = _resize_instance_stack(image_instances.unsqueeze(1).float(), proto_shape)
 
-        core = _pairwise_contact_core(
+        core = _vectorized_contact_core(
             instance_masks=instance_masks,
             min_area=min_area,
             dilation_radius=dilation_radius,

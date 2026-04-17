@@ -494,6 +494,8 @@ class v8SegmentationLoss(v8DetectionLoss):
             raise RuntimeError("FA-CZS head is missing 'contact_logit' in training predictions.")
 
         loss = torch.zeros(6 if self.has_contact else 5, device=self.device)  # box, seg, cls, dfl, sem, contact
+        masks = batch["masks"].to(self.device).float()
+        batch_idx = batch["batch_idx"].view(-1)
         if isinstance(proto, tuple) and len(proto) == 2:
             proto, pred_semseg = proto
         else:
@@ -505,7 +507,6 @@ class v8SegmentationLoss(v8DetectionLoss):
         batch_size, _, mask_h, mask_w = proto.shape  # batch size, number of masks, mask height, mask width
         if fg_mask.sum():
             # Masks loss
-            masks = batch["masks"].to(self.device).float()
             if tuple(masks.shape[-2:]) != (mask_h, mask_w):  # downsample
                 # masks = F.interpolate(masks[None], (mask_h, mask_w), mode="nearest")[0]
                 proto = F.interpolate(proto, masks.shape[-2:], mode="bilinear", align_corners=False)
@@ -518,7 +519,7 @@ class v8SegmentationLoss(v8DetectionLoss):
                 masks,
                 target_gt_idx,
                 target_bboxes,
-                batch["batch_idx"].view(-1, 1),
+                batch_idx.view(-1, 1),
                 proto,
                 pred_masks,
                 imgsz,
@@ -531,7 +532,6 @@ class v8SegmentationLoss(v8DetectionLoss):
                     mask_zero = masks == 0  # NxHxW
                     sem_masks[mask_zero.unsqueeze(1).expand_as(sem_masks)] = 0
                 else:
-                    batch_idx = batch["batch_idx"].view(-1)  # [total_instances]
                     for i in range(batch_size):
                         instance_mask_i = masks[batch_idx == i]  # [num_instances_i, H, W]
                         if len(instance_mask_i) == 0:
@@ -550,11 +550,11 @@ class v8SegmentationLoss(v8DetectionLoss):
         loss[1] *= self.hyp.box  # seg gain
         if self.has_contact:
             contact_target = build_contact_targets(
-                masks=batch["masks"].to(self.device).float(),
+                masks=masks,
                 proto_shape=pred_contact.shape[-2:],
                 overlap=self.overlap,
-                batch_idx=batch["batch_idx"].view(-1),
-                batch_size=pred_contact.shape[0],
+                batch_idx=batch_idx,
+                batch_size=batch_size,
             )
             loss[5] = self.contact_bcedice_loss(pred_contact, contact_target) * self.contact_loss_weight
         total_loss = loss.sum()
