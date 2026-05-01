@@ -1258,6 +1258,7 @@ class SegmentMetrics(DetMetrics):
                 "sq": [],
                 "rq": [],
                 "aji": [],
+                "aji_plus": [],
                 "dice": [],
                 "tp_cnt": [],
                 "fp_cnt": [],
@@ -1315,11 +1316,9 @@ class SegmentMetrics(DetMetrics):
         self.tp = float(stats["tp_cnt"].sum()) if len(stats.get("tp_cnt", [])) else 0.0
         self.fp = float(stats["fp_cnt"].sum()) if len(stats.get("fp_cnt", [])) else 0.0
         self.fn = float(stats["fn_cnt"].sum()) if len(stats.get("fn_cnt", [])) else 0.0
-        iou_sum_tp = float(stats["iou_sum_tp"].sum()) if len(stats.get("iou_sum_tp", [])) else 0.0
-        rq_denom = self.tp + 0.5 * self.fp + 0.5 * self.fn
-        self.rq = float(self.tp / rq_denom) if rq_denom > 0 else 0.0
-        self.sq = float(iou_sum_tp / self.tp) if self.tp > 0 else 0.0
-        self.pq = float(self.sq * self.rq)
+        self.rq = float(stats["rq"].mean()) if len(stats.get("rq", [])) else 0.0
+        self.sq = float(stats["sq"].mean()) if len(stats.get("sq", [])) else 0.0
+        self.pq = float(stats["pq"].mean()) if len(stats.get("pq", [])) else 0.0
         self.aji = float(stats["aji"].mean()) if len(stats.get("aji", [])) else 0.0
         self.dice = float(stats["dice"].mean()) if len(stats.get("dice", [])) else 0.0
         ng_inst = float(stats["ng_inst"].sum()) if len(stats.get("ng_inst", [])) else 0.0

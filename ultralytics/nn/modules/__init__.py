@@ -78,6 +78,7 @@ from .conv import (
 )
 from .head import (
     FACZSSegment,
+    FAOCDSegment,
     OBB,
     OBB26,
     Classify,
@@ -168,6 +169,7 @@ __all__ = (
     "DeformableTransformerDecoderLayer",
     "Detect",
     "FACZSSegment",
+    "FAOCDSegment",
     "Focus",
     "GhostBottleneck",
     "GhostConv",

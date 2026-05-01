@@ -1,8 +1,22 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
+import torch
+
 from ultralytics.engine.results import Results
 from ultralytics.models.yolo.detect.predict import DetectionPredictor
 from ultralytics.utils import DEFAULT_CFG, ops
+from ultralytics.utils.ocd_realization import decode_masks_with_ocd
+
+
+def _resolve_segment_head(model):
+    """Resolve the underlying segment head from wrapped or unwrapped models."""
+    core = getattr(model, "model", None)
+    if isinstance(core, torch.nn.Sequential):
+        return core[-1]
+    nested = getattr(core, "model", None)
+    if isinstance(nested, torch.nn.Sequential):
+        return nested[-1]
+    return None
 
 
 class SegmentationPredictor(DetectionPredictor):
@@ -59,6 +73,7 @@ class SegmentationPredictor(DetectionPredictor):
             >>> predictor = SegmentationPredictor(overrides=dict(model="yolo26n-seg.pt"))
             >>> results = predictor.postprocess(preds, img, orig_img)
         """
+        self.ocd_extras = preds[1] if isinstance(preds, tuple) and len(preds) > 1 and isinstance(preds[1], dict) else None
         # Extract protos - tuple if PyTorch model or array if exported
         protos = preds[0][1] if isinstance(preds[0], tuple) else preds[1]
         return super().postprocess(preds[0], img, orig_imgs, protos=protos)
@@ -76,12 +91,18 @@ class SegmentationPredictor(DetectionPredictor):
             (list[Results]): List of result objects containing the original images, image paths, class names, bounding
                 boxes, and masks.
         """
+        extras = None
+        if isinstance(self.ocd_extras, dict):
+            extras = [
+                {k: (v[i] if isinstance(v, torch.Tensor) and v.ndim > 0 and v.shape[0] == len(preds) else v) for k, v in self.ocd_extras.items()}
+                for i in range(len(preds))
+            ]
         return [
-            self.construct_result(pred, img, orig_img, img_path, proto)
-            for pred, orig_img, img_path, proto in zip(preds, orig_imgs, self.batch[0], protos)
+            self.construct_result(pred, img, orig_img, img_path, proto, None if extras is None else extras[i])
+            for i, (pred, orig_img, img_path, proto) in enumerate(zip(preds, orig_imgs, self.batch[0], protos))
         ]
 
-    def construct_result(self, pred, img, orig_img, img_path, proto):
+    def construct_result(self, pred, img, orig_img, img_path, proto, ocd_extra=None):
         """Construct a single result object from the prediction.
 
         Args:
@@ -98,12 +119,45 @@ class SegmentationPredictor(DetectionPredictor):
             masks = None
         elif self.args.retina_masks:
             pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape)
-            masks = ops.process_mask_native(proto, pred[:, 6:], pred[:, :4], orig_img.shape[:2])  # NHW
+            masks = self._decode_masks(pred, proto, img, orig_img, native=True, ocd_extra=ocd_extra)
         else:
-            masks = ops.process_mask(proto, pred[:, 6:], pred[:, :4], img.shape[2:], upsample=True)  # NHW
+            masks = self._decode_masks(pred, proto, img, orig_img, native=False, ocd_extra=ocd_extra)
             pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape)
         if masks is not None:
             keep = masks.amax((-2, -1)) > 0  # only keep predictions with masks
             if not all(keep):  # most predictions have masks
                 pred, masks = pred[keep], masks[keep]  # indexing is slow
         return Results(orig_img, path=img_path, names=self.model.names, boxes=pred[:, :6], masks=masks)
+
+    def _decode_masks(self, pred, proto, img, orig_img, native: bool, ocd_extra=None):
+        """Decode masks, optionally using the shared FA-OCD realization bridge."""
+        head = _resolve_segment_head(self.model)
+        nm = int(getattr(head, "nm", pred.shape[1] - 6))
+        apd_enabled = bool(getattr(head, "enable_apd_prior", False))
+        coeff = pred[:, 6 : 6 + nm]
+        apd_code = pred[:, 6 + nm : 6 + nm + 4] if apd_enabled and pred.shape[1] >= 6 + nm + 4 else None
+        if ocd_extra is None or not getattr(head, "ocd_enabled", False):
+            if native:
+                return ops.process_mask_native(proto, coeff, pred[:, :4], orig_img.shape[:2])
+            return ops.process_mask(proto, coeff, pred[:, :4], img.shape[2:], upsample=True)
+
+        image_shape = orig_img.shape[:2] if native else img.shape[2:]
+        masks, _ = decode_masks_with_ocd(
+            proto=proto,
+            mask_coeff=coeff,
+            boxes=pred[:, :4],
+            shape=image_shape,
+            mult_map=ocd_extra.get("ocd_mult"),
+            rho_map=ocd_extra.get("ocd_rho"),
+            xi_map=ocd_extra.get("ocd_xi"),
+            apd_code=apd_code,
+            native=native,
+            ambiguity_threshold=float(getattr(head, "ambiguity_threshold", 0.35)),
+            realization_alpha=float(getattr(head, "realization_alpha", 0.25)),
+            apd_gamma=float(getattr(head, "apd_gamma", 0.1)),
+            xi_bridge_weight=float(getattr(head, "xi_bridge_weight", 0.15)),
+            xi_only=bool(getattr(head, "xi_only", False)),
+            stability_threshold=float(getattr(head, "stability_threshold", 0.2)),
+            upsample=not native,
+        )
+        return masks

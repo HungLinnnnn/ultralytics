@@ -14,13 +14,13 @@ PROJECT=DSB2018_stardist
 # /home/r13922151/miniconda3/envs/yolo-ssm/bin/pip install -e .
 
 # -------------------- baseline ----------------------
-# CUDA_VISIBLE_DEVICES=2 \
+# CUDA_VISIBLE_DEVICES=6 \
 # yolo segment train \
 #     model=ultralytics/cfg/models/v8/yolov8-seg.yaml \
 #     data=$DATA \
-#     batch=50 epochs=1500 device=2 \
-#     pretrained=yolov8l-seg.pt \
-#     project=$PROJECT name=baseline_scaleL \
+#     batch=16 epochs=1500 device=6 \
+#     pretrained=yolov8x-seg.pt \
+#     project=$PROJECT name=baseline_scaleX \
 #     seg_metric_backend=native seg_metric_legacy_pq_reduce=imagewise \
 #     patience=300
 
@@ -36,15 +36,15 @@ PROJECT=DSB2018_stardist
 #     seg_metric_backend=native seg_metric_legacy_pq_reduce=imagewise \
 #     patience=250
 
-CUDA_VISIBLE_DEVICES=3 \
-yolo segment train \
-    model=ultralytics/cfg/models/v8/yolov8-seg-ssm-pan/alphainit0_2_noGabor.yaml \
-    data=$DATA \
-    batch=128 epochs=1500 device=3 \
-    pretrained=yolov8n-seg.pt \
-    project=$PROJECT name=alpheInit0.2_offset2.0_noGabor_fallback_scaleN \
-    seg_metric_backend=native seg_metric_legacy_pq_reduce=imagewise \
-    patience=300
+# CUDA_VISIBLE_DEVICES=4 \
+# yolo segment train \
+#     model=ultralytics/cfg/models/v8/yolov8-seg-ssm-pan/alphainit0_2_noGabor.yaml \
+#     data=$DATA \
+#     batch=6 epochs=200 device=4 \
+#     pretrained=yolov8n-seg.pt \
+#     project=$PROJECT name=alpheInit0.2_offset2.0_noGabor_fallback_scaleN_legacy_bs6 \
+#     seg_metric_backend=legacy seg_metric_legacy_pq_reduce=imagewise \
+#     patience=50
 
 # ------------------------ stage A -------------------------
 # CUDA_VISIBLE_DEVICES=2 \

@@ -16,12 +16,25 @@ from ultralytics.utils.eval_seg_metric_for_yolo_legacy import (
     compute_imagewise_pq,
     get_dice_1,
     get_fast_aji,
+    get_fast_aji_plus,
     pq_stats_from_labels,
     remap_label,
     stack_masks_to_label_map,
 )
-from ultralytics.utils.instance_metrics import compute_pq_components_from_iou, compute_split_merge_from_iou
-from ultralytics.utils.metrics import SegmentMetrics, mask_iou, compute_aji, compute_dice
+from ultralytics.utils.instance_metrics import compute_split_merge_from_iou
+from ultralytics.utils.metrics import SegmentMetrics, mask_iou
+from ultralytics.utils.ocd_realization import decode_masks_with_ocd
+
+
+def _resolve_segment_head(model):
+    """Resolve the underlying segment head from wrapped or unwrapped models."""
+    core = getattr(model, "model", None)
+    if isinstance(core, torch.nn.Sequential):
+        return core[-1]
+    nested = getattr(core, "model", None)
+    if isinstance(nested, torch.nn.Sequential):
+        return nested[-1]
+    return None
 
 
 class SegmentationValidator(DetectionValidator):
@@ -57,7 +70,7 @@ class SegmentationValidator(DetectionValidator):
         self.process = None
         self.args.task = "segment"
         self.metrics = SegmentMetrics()
-        self.seg_metric_backend = "native"
+        self.seg_metric_backend = "legacy"
         self.seg_metric_legacy_pq_reduce = "imagewise"
 
     def preprocess(self, batch: dict[str, Any]) -> dict[str, Any]:
@@ -80,20 +93,21 @@ class SegmentationValidator(DetectionValidator):
             model (torch.nn.Module): Model to validate.
         """
         super().init_metrics(model)
+        self._ocd_head = _resolve_segment_head(model)
         if self.args.save_json:
             check_requirements("faster-coco-eval>=1.6.7")
-        # More accurate vs faster
-        self.process = ops.process_mask_native if self.args.save_json or self.args.save_txt else ops.process_mask
-        self.seg_metric_backend = str(getattr(self.args, "seg_metric_backend", "native")).lower()
+        # Match the lab evaluator path: operate on full-resolution masks like YOLO.predict(..., retina_masks=True).
+        self.process = ops.process_mask_native
+        self.seg_metric_backend = str(getattr(self.args, "seg_metric_backend", "legacy")).lower()
         self.seg_metric_legacy_pq_reduce = str(getattr(self.args, "seg_metric_legacy_pq_reduce", "imagewise")).lower()
-        if self.seg_metric_backend not in {"native", "legacy"}:
+        if self.seg_metric_backend not in {"legacy", "native"}:
             raise ValueError(
                 f"Invalid seg_metric_backend={self.seg_metric_backend!r}. Expected one of: native, legacy"
             )
-        if self.seg_metric_backend == "legacy" and self.seg_metric_legacy_pq_reduce != "imagewise":
+        if self.seg_metric_legacy_pq_reduce != "imagewise":
             raise ValueError(
                 "Invalid seg_metric_legacy_pq_reduce="
-                f"{self.seg_metric_legacy_pq_reduce!r}. Currently only 'imagewise' is supported."
+                f"{self.seg_metric_legacy_pq_reduce!r}. Legacy evaluator only supports 'imagewise'."
             )
 
     def get_desc(self) -> str:
@@ -128,20 +142,45 @@ class SegmentationValidator(DetectionValidator):
         Returns:
             list[dict[str, torch.Tensor]]: Processed detection predictions with masks.
         """
+        extras = preds[1] if isinstance(preds, tuple) and len(preds) > 1 and isinstance(preds[1], dict) else None
         proto = preds[0][1] if isinstance(preds[0], tuple) else preds[1]
         preds = super().postprocess(preds[0])
         imgsz = [4 * x for x in proto.shape[2:]]  # get image size from proto
+        head = getattr(self, "_ocd_head", None)
+        nm = int(getattr(head, "nm", 32))
+        apd_enabled = bool(getattr(head, "enable_apd_prior", False))
         for i, pred in enumerate(preds):
             coefficient = pred.pop("extra")
-            pred["masks"] = (
-                self.process(proto[i], coefficient, pred["bboxes"], shape=imgsz)
-                if coefficient.shape[0]
-                else torch.zeros(
+            if coefficient.shape[0]:
+                mask_coeff = coefficient[:, :nm]
+                apd_code = coefficient[:, nm : nm + 4] if apd_enabled and coefficient.shape[1] >= nm + 4 else None
+                if extras is not None and getattr(head, "ocd_enabled", False):
+                    pred["masks"], _ = decode_masks_with_ocd(
+                        proto=proto[i],
+                        mask_coeff=mask_coeff,
+                        boxes=pred["bboxes"],
+                        shape=imgsz,
+                        mult_map=extras.get("ocd_mult")[i] if extras.get("ocd_mult") is not None else None,
+                        rho_map=extras.get("ocd_rho")[i] if extras.get("ocd_rho") is not None else None,
+                        xi_map=extras.get("ocd_xi")[i] if extras.get("ocd_xi") is not None else None,
+                        apd_code=apd_code,
+                        native=self.process is ops.process_mask_native,
+                        ambiguity_threshold=float(getattr(head, "ambiguity_threshold", 0.35)),
+                        realization_alpha=float(getattr(head, "realization_alpha", 0.25)),
+                        apd_gamma=float(getattr(head, "apd_gamma", 0.1)),
+                        xi_bridge_weight=float(getattr(head, "xi_bridge_weight", 0.15)),
+                        xi_only=bool(getattr(head, "xi_only", False)),
+                        stability_threshold=float(getattr(head, "stability_threshold", 0.2)),
+                        upsample=False,
+                    )
+                else:
+                    pred["masks"] = self.process(proto[i], mask_coeff, pred["bboxes"], shape=imgsz)
+            else:
+                pred["masks"] = torch.zeros(
                     (0, *(imgsz if self.process is ops.process_mask_native else proto.shape[2:])),
                     dtype=torch.uint8,
                     device=pred["bboxes"].device,
                 )
-            )
         return preds
 
     def _prepare_batch(self, si: int, batch: dict[str, Any]) -> dict[str, Any]:
@@ -202,73 +241,37 @@ class SegmentationValidator(DetectionValidator):
             iou_np = np.zeros((ng, npred), dtype=np.float64)
             tp_m = np.zeros((preds["cls"].shape[0], self.niou), dtype=bool)
 
-        pq_comp = compute_pq_components_from_iou(iou_np, thr=0.5, method="auto")
         sm_comp = compute_split_merge_from_iou(iou_np, ng=ng, npred=npred, thr=0.5)
-        pq = np.array([pq_comp["pq"]], dtype=float)
-        sq = np.array([pq_comp["sq"]], dtype=float)
-        rq = np.array([pq_comp["rq"]], dtype=float)
-        tp_cnt = np.array([pq_comp["tp"]], dtype=float)
-        fp_cnt = np.array([pq_comp["fp"]], dtype=float)
-        fn_cnt = np.array([pq_comp["fn"]], dtype=float)
-        iou_sum_tp = np.array([pq_comp["iou_sum"]], dtype=float)
-        ng_inst = np.array([pq_comp["ng"]], dtype=float)
-        np_inst = np.array([pq_comp["npred"]], dtype=float)
         split_count = np.array([sm_comp["split_count"]], dtype=float)
         merge_count = np.array([sm_comp["merge_count"]], dtype=float)
         split_rate = np.array([sm_comp["split_rate"]], dtype=float)
         merge_rate = np.array([sm_comp["merge_rate"]], dtype=float)
-        mean_iou_tp = np.array([pq_comp["mean_iou_tp"]], dtype=float)
+        gt_label = remap_label(stack_masks_to_label_map(gt_stack))
+        pred_label = remap_label(stack_masks_to_label_map(pred_stack))
 
-        gt_cls = batch["cls"]
-        if gt_cls.shape[0] == 0 or preds["cls"].shape[0] == 0:
-            if self.seg_metric_backend == "legacy" and gt_cls.shape[0] == 0 and preds["cls"].shape[0] == 0:
-                aji = np.array([1.0], dtype=float)
-                dice = np.array([1.0], dtype=float)
-            else:
-                aji = np.array([0.0], dtype=float)
-                dice = np.array([0.0], dtype=float)
+        dice = np.array([get_dice_1(gt_label, pred_label)], dtype=float)
+        aji = np.array([get_fast_aji(gt_label, pred_label)], dtype=float)
+        aji_plus = np.array([get_fast_aji_plus(gt_label, pred_label)], dtype=float)
+        tp_cnt_legacy, fp_cnt_legacy, fn_cnt_legacy, iou_sum_legacy = pq_stats_from_labels(
+            gt_label, pred_label, match_iou=0.5
+        )
+        if (tp_cnt_legacy + fp_cnt_legacy + fn_cnt_legacy) == 0:
+            rq_i = sq_i = pq_i = 1.0
         else:
-            if self.seg_metric_backend == "legacy":
-                gt_label = remap_label(stack_masks_to_label_map(gt_stack))
-                pred_label = remap_label(stack_masks_to_label_map(pred_stack))
+            rq_i = tp_cnt_legacy / (tp_cnt_legacy + 0.5 * fp_cnt_legacy + 0.5 * fn_cnt_legacy + 1e-6)
+            sq_i = iou_sum_legacy / (tp_cnt_legacy + 1e-6)
+            pq_i = compute_imagewise_pq(tp_cnt_legacy, fp_cnt_legacy, fn_cnt_legacy, iou_sum_legacy)
 
-                dice = np.array([get_dice_1(gt_label, pred_label)], dtype=float)
-                aji = np.array([get_fast_aji(gt_label, pred_label)], dtype=float)
-                tp_cnt_legacy, fp_cnt_legacy, fn_cnt_legacy, iou_sum_legacy = pq_stats_from_labels(
-                    gt_label, pred_label, match_iou=0.5
-                )
-                if self.seg_metric_legacy_pq_reduce == "imagewise":
-                    _ = compute_imagewise_pq(
-                        tp_cnt_legacy, fp_cnt_legacy, fn_cnt_legacy, iou_sum_legacy
-                    )  # keep legacy code path behavior
-                else:
-                    raise ValueError(
-                        "Unsupported seg_metric_legacy_pq_reduce="
-                        f"{self.seg_metric_legacy_pq_reduce!r}."
-                    )
-            else:
-                # PQ/AJI/Dice
-                gt_masks = batch["masks"].flatten(1).bool()
-                pred_masks = preds["masks"].flatten(1).float().gt(0.5)
-                matches = np.argwhere(iou_np >= 0.5)
-                if matches.shape[0]:
-                    matches = matches[np.argsort(iou_np[matches[:, 0], matches[:, 1]])[::-1]]
-                    used_g, used_p, kept = set(), set(), []
-                    for g, p in matches:
-                        if g not in used_g and p not in used_p:
-                            used_g.add(int(g))
-                            used_p.add(int(p))
-                            kept.append((int(g), int(p)))
-                else:
-                    kept = []
-
-                gt_np = gt_masks.cpu().numpy()
-                pred_np = pred_masks.cpu().numpy()
-                aji = np.array([compute_aji(gt_np, pred_np, kept)], dtype=float)
-
-                gt_union = gt_np.any(axis=0)
-                pred_union = pred_np.any(axis=0)
-                dice = np.array([compute_dice(gt_union, pred_union)], dtype=float)
+        pq = np.array([pq_i], dtype=float)
+        sq = np.array([sq_i], dtype=float)
+        rq = np.array([rq_i], dtype=float)
+        tp_cnt = np.array([tp_cnt_legacy], dtype=float)
+        fp_cnt = np.array([fp_cnt_legacy], dtype=float)
+        fn_cnt = np.array([fn_cnt_legacy], dtype=float)
+        iou_sum_tp = np.array([iou_sum_legacy], dtype=float)
+        ng_inst = np.array([max(len(np.unique(gt_label)) - 1, 0)], dtype=float)
+        np_inst = np.array([max(len(np.unique(pred_label)) - 1, 0)], dtype=float)
+        mean_iou_tp = np.array([sq_i], dtype=float)
         tp.update(
             {
                 "tp_m": tp_m,
@@ -276,6 +279,7 @@ class SegmentationValidator(DetectionValidator):
                 "sq": sq,
                 "rq": rq,
                 "aji": aji,
+                "aji_plus": aji_plus,
                 "dice": dice,
                 "tp_cnt": tp_cnt,
                 "fp_cnt": fp_cnt,

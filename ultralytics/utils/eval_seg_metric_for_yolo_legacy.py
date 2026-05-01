@@ -73,20 +73,19 @@ def remap_label(pred: np.ndarray, by_size: bool = False) -> np.ndarray:
 
 
 def get_fast_aji(true: np.ndarray, pred: np.ndarray) -> float:
-    """AJI implementation from legacy script (MoNuSeg style)."""
+    """AJI version distributed by MoNuSeg."""
     if np.max(true) == 0 and np.max(pred) == 0:
         return 1.0
     if np.max(true) == 0 or np.max(pred) == 0:
         return 0.0
 
-    # Keep legacy behavior while guarding against non-contiguous instance IDs.
-    true = remap_label(np.copy(true))
-    pred = remap_label(np.copy(pred))
+    true = np.copy(true)
+    pred = np.copy(pred)
     true_id_list = list(np.unique(true))
     pred_id_list = list(np.unique(pred))
 
-    true_ids = [int(t) for t in true_id_list[1:]]
-    pred_ids = [int(p) for p in pred_id_list[1:]]
+    true_ids = [int(t) for t in true_id_list if int(t) != 0]
+    pred_ids = [int(p) for p in pred_id_list if int(p) != 0]
     true_masks = {t: np.array(true == t, np.uint8) for t in true_ids}
     pred_masks = {p: np.array(pred == p, np.uint8) for p in pred_ids}
     true_id_to_idx = {t: i for i, t in enumerate(true_ids)}
@@ -98,18 +97,16 @@ def get_fast_aji(true: np.ndarray, pred: np.ndarray) -> float:
     for true_id in true_ids:
         t_mask = true_masks[true_id]
         pred_true_overlap = pred[t_mask > 0]
-        pred_true_overlap_id = list(np.unique(pred_true_overlap))
+        pred_true_overlap_id = np.unique(pred_true_overlap)
+        pred_true_overlap_id = list(pred_true_overlap_id)
         for pred_id in pred_true_overlap_id:
-            pred_id = int(pred_id)
-            if pred_id == 0 or pred_id not in pred_masks:
+            if pred_id == 0:
                 continue
             p_mask = pred_masks[pred_id]
             total = (t_mask + p_mask).sum()
             inter = (t_mask * p_mask).sum()
-            ti = true_id_to_idx[true_id]
-            pi = pred_id_to_idx[pred_id]
-            pairwise_inter[ti, pi] = inter
-            pairwise_union[ti, pi] = total - inter
+            pairwise_inter[true_id_to_idx[true_id], pred_id_to_idx[int(pred_id)]] = inter
+            pairwise_union[true_id_to_idx[true_id], pred_id_to_idx[int(pred_id)]] = total - inter
 
     pairwise_iou = pairwise_inter / (pairwise_union + 1.0e-6)
     paired_pred = np.argmax(pairwise_iou, axis=1)
@@ -120,21 +117,21 @@ def get_fast_aji(true: np.ndarray, pred: np.ndarray) -> float:
     overall_inter = (pairwise_inter[paired_true, paired_pred]).sum()
     overall_union = (pairwise_union[paired_true, paired_pred]).sum()
 
-    paired_true_ids = {true_ids[i] for i in paired_true.tolist()}
-    paired_pred_ids = {pred_ids[i] for i in paired_pred.tolist()}
+    paired_true = [true_ids[i] for i in paired_true.tolist()]
+    paired_pred = [pred_ids[i] for i in paired_pred.tolist()]
 
-    unpaired_true = [idx for idx in true_ids if idx not in paired_true_ids]
-    unpaired_pred = [idx for idx in pred_ids if idx not in paired_pred_ids]
+    unpaired_true = np.array([idx for idx in true_ids if idx not in paired_true])
+    unpaired_pred = np.array([idx for idx in pred_ids if idx not in paired_pred])
     for true_id in unpaired_true:
-        overall_union += true_masks[int(true_id)].sum()
+        overall_union += true_masks[true_id].sum()
     for pred_id in unpaired_pred:
-        overall_union += pred_masks[int(pred_id)].sum()
+        overall_union += pred_masks[pred_id].sum()
 
     return float(overall_inter / overall_union)
 
 
 def get_fast_aji_plus(true: np.ndarray, pred: np.ndarray) -> float:
-    """AJI+ from legacy script (kept for optional future reporting)."""
+    """AJI+, an AJI version with maximal unique pairing."""
     from scipy.optimize import linear_sum_assignment
 
     if np.max(true) == 0 and np.max(pred) == 0:
@@ -142,14 +139,13 @@ def get_fast_aji_plus(true: np.ndarray, pred: np.ndarray) -> float:
     if np.max(true) == 0 or np.max(pred) == 0:
         return 0.0
 
-    # Keep legacy behavior while guarding against non-contiguous instance IDs.
-    true = remap_label(np.copy(true))
-    pred = remap_label(np.copy(pred))
+    true = np.copy(true)
+    pred = np.copy(pred)
     true_id_list = list(np.unique(true))
     pred_id_list = list(np.unique(pred))
 
-    true_ids = [int(t) for t in true_id_list[1:]]
-    pred_ids = [int(p) for p in pred_id_list[1:]]
+    true_ids = [int(t) for t in true_id_list if int(t) != 0]
+    pred_ids = [int(p) for p in pred_id_list if int(p) != 0]
     true_masks = {t: np.array(true == t, np.uint8) for t in true_ids}
     pred_masks = {p: np.array(pred == p, np.uint8) for p in pred_ids}
     true_id_to_idx = {t: i for i, t in enumerate(true_ids)}
@@ -161,18 +157,16 @@ def get_fast_aji_plus(true: np.ndarray, pred: np.ndarray) -> float:
     for true_id in true_ids:
         t_mask = true_masks[true_id]
         pred_true_overlap = pred[t_mask > 0]
-        pred_true_overlap_id = list(np.unique(pred_true_overlap))
+        pred_true_overlap_id = np.unique(pred_true_overlap)
+        pred_true_overlap_id = list(pred_true_overlap_id)
         for pred_id in pred_true_overlap_id:
-            pred_id = int(pred_id)
-            if pred_id == 0 or pred_id not in pred_masks:
+            if pred_id == 0:
                 continue
             p_mask = pred_masks[pred_id]
             total = (t_mask + p_mask).sum()
             inter = (t_mask * p_mask).sum()
-            ti = true_id_to_idx[true_id]
-            pi = pred_id_to_idx[pred_id]
-            pairwise_inter[ti, pi] = inter
-            pairwise_union[ti, pi] = total - inter
+            pairwise_inter[true_id_to_idx[true_id], pred_id_to_idx[int(pred_id)]] = inter
+            pairwise_union[true_id_to_idx[true_id], pred_id_to_idx[int(pred_id)]] = total - inter
 
     pairwise_iou = pairwise_inter / (pairwise_union + 1.0e-6)
     paired_true, paired_pred = linear_sum_assignment(-pairwise_iou)
@@ -182,18 +176,17 @@ def get_fast_aji_plus(true: np.ndarray, pred: np.ndarray) -> float:
     paired_pred = paired_pred[paired_iou > 0.0]
     paired_inter = pairwise_inter[paired_true, paired_pred]
     paired_union = pairwise_union[paired_true, paired_pred]
-
-    paired_true_ids = {true_ids[i] for i in paired_true.tolist()}
-    paired_pred_ids = {pred_ids[i] for i in paired_pred.tolist()}
     overall_inter = paired_inter.sum()
     overall_union = paired_union.sum()
 
-    unpaired_true = [idx for idx in true_ids if idx not in paired_true_ids]
-    unpaired_pred = [idx for idx in pred_ids if idx not in paired_pred_ids]
+    paired_true = [true_ids[i] for i in paired_true.tolist()]
+    paired_pred = [pred_ids[i] for i in paired_pred.tolist()]
+    unpaired_true = np.array([idx for idx in true_ids if idx not in paired_true])
+    unpaired_pred = np.array([idx for idx in pred_ids if idx not in paired_pred])
     for true_id in unpaired_true:
-        overall_union += true_masks[int(true_id)].sum()
+        overall_union += true_masks[true_id].sum()
     for pred_id in unpaired_pred:
-        overall_union += pred_masks[int(pred_id)].sum()
+        overall_union += pred_masks[pred_id].sum()
 
     return float(overall_inter / overall_union)
 

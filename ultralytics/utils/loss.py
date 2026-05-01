@@ -17,6 +17,7 @@ from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigne
 from ultralytics.utils.torch_utils import autocast
 
 from .contact_targets import build_contact_targets
+from .ocd_targets import build_ocd_targets
 from .metrics import bbox_iou, probiou
 from .tal import bbox2dist, rbox2dist
 
@@ -483,6 +484,13 @@ class v8SegmentationLoss(v8DetectionLoss):
         self.contact_bcedice_loss = BCEDiceLoss(weight_bce=0.5, weight_dice=0.5)
         self.has_contact = hasattr(m, "contact_loss_weight")
         self.contact_loss_weight = float(getattr(m, "contact_loss_weight", 0.0))
+        self.has_ocd = bool(getattr(m, "ocd_enabled", False))
+        self.use_pair_axis = bool(getattr(m, "use_pair_axis", False))
+        self.enable_apd_prior = bool(getattr(m, "enable_apd_prior", False))
+        self.mult_loss_weight = float(getattr(m, "mult_loss_weight", 0.0))
+        self.rho_loss_weight = float(getattr(m, "rho_loss_weight", 0.0))
+        self.apd_loss_weight = float(getattr(m, "apd_loss_weight", 0.0))
+        self.xi_loss_weight = float(getattr(m, "xi_loss_weight", 0.0))
         self.bdf_modules = [m for m in model.modules() if isinstance(m, (BDFWarpUp, PBDFWarpUp, PGBDFWarpUp))]
         self.ssm_loss = SSMLoss(weight=0.1)
 
@@ -490,10 +498,17 @@ class v8SegmentationLoss(v8DetectionLoss):
         """Calculate and return the combined loss for detection and segmentation."""
         pred_masks, proto = preds["mask_coefficient"].permute(0, 2, 1).contiguous(), preds["proto"]
         pred_contact = preds.get("contact_logit")
+        pred_mult = preds.get("ocd_mult")
+        pred_rho = preds.get("ocd_rho")
+        pred_xi = preds.get("ocd_xi")
+        pred_apd = preds.get("apd_code")
         if self.has_contact and pred_contact is None:
             raise RuntimeError("FA-CZS head is missing 'contact_logit' in training predictions.")
+        if self.has_ocd and (pred_mult is None or pred_rho is None):
+            raise RuntimeError("FA-OCD head is missing 'ocd_mult' or 'ocd_rho' in training predictions.")
 
-        loss = torch.zeros(6 if self.has_contact else 5, device=self.device)  # box, seg, cls, dfl, sem, contact
+        loss_size = 5 + int(self.has_contact) + (3 + int(self.use_pair_axis) if self.has_ocd else 0)
+        loss = torch.zeros(loss_size, device=self.device)
         masks = batch["masks"].to(self.device).float()
         batch_idx = batch["batch_idx"].view(-1)
         if isinstance(proto, tuple) and len(proto) == 2:
@@ -548,6 +563,7 @@ class v8SegmentationLoss(v8DetectionLoss):
                 loss[4] += (pred_semseg * 0).sum()
 
         loss[1] *= self.hyp.box  # seg gain
+        tail_index = 5
         if self.has_contact:
             contact_target = build_contact_targets(
                 masks=masks,
@@ -556,7 +572,52 @@ class v8SegmentationLoss(v8DetectionLoss):
                 batch_idx=batch_idx,
                 batch_size=batch_size,
             )
-            loss[5] = self.contact_bcedice_loss(pred_contact, contact_target) * self.contact_loss_weight
+            loss[tail_index] = self.contact_bcedice_loss(pred_contact, contact_target) * self.contact_loss_weight
+            tail_index += 1
+        if self.has_ocd:
+            ocd_targets = build_ocd_targets(
+                masks=masks,
+                proto_shape=pred_mult.shape[-2:],
+                overlap=self.overlap,
+                batch_idx=batch_idx,
+                batch_size=batch_size,
+                pair_axis_enabled=self.use_pair_axis,
+                apd_enabled=self.enable_apd_prior and pred_apd is not None,
+            )
+            loss[tail_index] = (
+                F.cross_entropy(pred_mult, ocd_targets["mult_tgt"], reduction="mean") * self.mult_loss_weight
+            )
+            tail_index += 1
+            amb_mask = ocd_targets["amb_mask"]
+            rho_log = F.log_softmax(pred_rho, dim=1)
+            rho_loss = -(ocd_targets["rho_tgt"] * rho_log).sum(dim=1, keepdim=True)
+            loss[tail_index] = (
+                (rho_loss * amb_mask).sum() / amb_mask.sum().clamp_min(1.0) * self.rho_loss_weight
+            )
+            tail_index += 1
+            if self.enable_apd_prior and pred_apd is not None:
+                pred_apd = pred_apd.permute(0, 2, 1).contiguous()
+                apd_loss_sum = pred_apd.sum() * 0.0
+                apd_count = pred_apd.new_tensor(0.0)
+                for image_idx, apd_gt in enumerate(ocd_targets["apd_tgt"]):
+                    if apd_gt.numel() == 0:
+                        continue
+                    pos = fg_mask[image_idx]
+                    if not pos.any():
+                        continue
+                    matched_gt = target_gt_idx[image_idx, pos].long().clamp_(0, apd_gt.shape[0] - 1)
+                    apd_pred_i = pred_apd[image_idx, pos]
+                    apd_gt_i = apd_gt.to(apd_pred_i.device)[matched_gt]
+                    apd_loss_sum = apd_loss_sum + F.smooth_l1_loss(apd_pred_i, apd_gt_i, reduction="sum")
+                    apd_count = apd_count + apd_pred_i.shape[0]
+                loss[tail_index] = apd_loss_sum / apd_count.clamp_min(1.0) * self.apd_loss_weight
+            tail_index += 1
+            if self.use_pair_axis and pred_xi is not None:
+                xi_log = F.log_softmax(pred_xi, dim=1)
+                xi_loss = -(ocd_targets["xi_tgt"] * xi_log).sum(dim=1, keepdim=True)
+                loss[tail_index] = (
+                    (xi_loss * amb_mask).sum() / amb_mask.sum().clamp_min(1.0) * self.xi_loss_weight
+                )
         total_loss = loss.sum()
         if self.bdf_modules:
             offsets = [m.last_offset for m in self.bdf_modules if m.last_offset is not None]

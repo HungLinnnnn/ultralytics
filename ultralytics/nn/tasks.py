@@ -47,6 +47,7 @@ from ultralytics.nn.modules import (
     Detect,
     DWConv,
     DWConvTranspose2d,
+    FAOCDSegment,
     FACZSSegment,
     Focus,
     GhostBottleneck,
@@ -1774,6 +1775,7 @@ def parse_model(d, ch, verbose=True):
         elif m in frozenset(
             {
                 Detect,
+                FAOCDSegment,
                 FACZSSegment,
                 WorldDetect,
                 YOLOEDetect,
@@ -1788,10 +1790,11 @@ def parse_model(d, ch, verbose=True):
             }
         ):
             args.extend([reg_max, end2end, [ch[x] for x in f]])
-            if m in {Segment, FACZSSegment, YOLOESegment, Segment26, YOLOESegment26}:
+            if m in {Segment, FAOCDSegment, FACZSSegment, YOLOESegment, Segment26, YOLOESegment26}:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
             if m in {
                 Detect,
+                FAOCDSegment,
                 YOLOEDetect,
                 Segment,
                 FACZSSegment,

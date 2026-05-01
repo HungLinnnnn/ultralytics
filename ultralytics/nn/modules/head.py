@@ -24,6 +24,7 @@ __all__ = (
     "OBB",
     "Classify",
     "Detect",
+    "FAOCDSegment",
     "Pose",
     "RTDETRDecoder",
     "Segment",
@@ -449,6 +450,150 @@ class FACZSSegment(Segment):
         preds["contact_logit"] = contact_logit
         preds["proto_delta"] = proto_delta
         return ((det_out, proto_ref), preds)
+
+
+class FAOCDSegment(Segment):
+    """FA-OCD + APD-prior v1 segmentation head with supervision-rewritten auxiliary outputs."""
+
+    def __init__(
+        self,
+        nc: int = 80,
+        nm: int = 32,
+        npr: int = 256,
+        ocd_channels: int = 128,
+        use_pair_axis: bool = False,
+        enable_apd_prior: bool = False,
+        mult_loss_weight: float = 0.2,
+        rho_loss_weight: float = 0.4,
+        apd_loss_weight: float = 0.1,
+        xi_loss_weight: float = 0.05,
+        ambiguity_threshold: float = 0.35,
+        realization_alpha: float = 0.25,
+        apd_gamma: float = 0.1,
+        xi_bridge_weight: float = 0.15,
+        xi_only: bool = False,
+        stability_threshold: float = 0.2,
+        reg_max=16,
+        end2end=False,
+        ch: tuple = (),
+    ):
+        """Initialize the approved supervision-rewritten FA-OCD head."""
+        super().__init__(nc, nm, npr, reg_max, end2end, ch)
+        self.ocd_channels = max(int(ocd_channels), 1)
+        self.use_pair_axis = bool(use_pair_axis)
+        self.enable_apd_prior = bool(enable_apd_prior)
+        self.mult_loss_weight = float(mult_loss_weight)
+        self.rho_loss_weight = float(rho_loss_weight)
+        self.apd_loss_weight = float(apd_loss_weight)
+        self.xi_loss_weight = float(xi_loss_weight)
+        self.ambiguity_threshold = float(ambiguity_threshold)
+        self.realization_alpha = float(realization_alpha)
+        self.apd_gamma = float(apd_gamma)
+        self.xi_bridge_weight = float(xi_bridge_weight)
+        self.xi_only = bool(xi_only)
+        self.stability_threshold = float(stability_threshold)
+        self.ocd_enabled = True
+
+        self.ocd_reduce_f3 = Conv(ch[0], self.ocd_channels, 3)
+        self.ocd_reduce_f4 = Conv(ch[1], self.ocd_channels, 1, 1)
+        self.ocd_fuse = Conv(self.ocd_channels * 2, self.ocd_channels, 3)
+        self.ocd_refine = Conv(self.ocd_channels, self.ocd_channels, 3)
+        self.ocd_upsample = nn.ConvTranspose2d(self.ocd_channels, self.ocd_channels, 2, 2, 0, bias=True)
+        self.ocd_mult_head = nn.Conv2d(self.ocd_channels, 4, 1)
+        self.ocd_rho_head = nn.Conv2d(self.ocd_channels, 2, 1)
+        self.ocd_xi_head = nn.Conv2d(self.ocd_channels, 2, 1) if self.use_pair_axis else None
+
+        apd_channels = max(ch[0] // 4, 4)
+        self.apd_head = (
+            nn.ModuleList(
+                nn.Sequential(Conv(x, apd_channels, 3), Conv(apd_channels, apd_channels, 3), nn.Conv2d(apd_channels, 4, 1))
+                for x in ch
+            )
+            if self.enable_apd_prior
+            else None
+        )
+
+    def _ocd_spatial_features(self, x: list[torch.Tensor], proto_shape: tuple[int, int]) -> torch.Tensor:
+        """Fuse local F3 detail with F4 context and project to proto resolution."""
+        f3 = self.ocd_reduce_f3(x[0])
+        f4 = F.interpolate(self.ocd_reduce_f4(x[1]), size=x[0].shape[-2:], mode="nearest")
+        spatial = self.ocd_fuse(torch.cat((f3, f4), dim=1))
+        spatial = self.ocd_refine(spatial)
+        spatial = self.ocd_upsample(spatial)
+        if spatial.shape[-2:] != proto_shape:
+            spatial = F.interpolate(spatial, size=proto_shape, mode="bilinear", align_corners=False)
+        return spatial
+
+    def _apd_anchor_code(self, x: list[torch.Tensor]) -> torch.Tensor | None:
+        """Predict per-anchor APD codes when the bounded prior is enabled."""
+        if self.apd_head is None:
+            return None
+        bs = x[0].shape[0]
+        return torch.cat([self.apd_head[i](x[i]).view(bs, 4, -1) for i in range(self.nl)], dim=2)
+
+    def _augment_preds(self, x: list[torch.Tensor], preds: dict[str, torch.Tensor], proto: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Add supervision-rewritten FA-OCD outputs to the prediction dictionary."""
+        spatial = self._ocd_spatial_features(x, proto.shape[-2:])
+        preds["ocd_mult"] = self.ocd_mult_head(spatial)
+        preds["ocd_rho"] = self.ocd_rho_head(spatial)
+        if self.ocd_xi_head is not None:
+            preds["ocd_xi"] = self.ocd_xi_head(spatial)
+        if self.apd_head is not None:
+            preds["apd_code"] = self._apd_anchor_code(x)
+        return preds
+
+    def forward(self, x: list[torch.Tensor]) -> tuple | list[torch.Tensor] | dict[str, torch.Tensor]:
+        """Return segmentation outputs plus FA-OCD auxiliary heads."""
+        outputs = super().forward(x)
+        if self.training:
+            preds = outputs
+            if self.end2end:
+                preds["one2many"] = self._augment_preds(x, preds["one2many"], preds["one2many"]["proto"])
+                preds["one2one"] = self._augment_preds(
+                    [xi.detach() for xi in x],
+                    preds["one2one"],
+                    preds["one2one"]["proto"],
+                )
+                preds["proto"] = preds["one2many"]["proto"]
+                preds["ocd_mult"] = preds["one2many"]["ocd_mult"]
+                preds["ocd_rho"] = preds["one2many"]["ocd_rho"]
+                if "ocd_xi" in preds["one2many"]:
+                    preds["ocd_xi"] = preds["one2many"]["ocd_xi"]
+                if "apd_code" in preds["one2many"]:
+                    preds["apd_code"] = preds["one2many"]["apd_code"]
+                return preds
+            return self._augment_preds(x, preds, preds["proto"])
+
+        if self.export:
+            return outputs
+
+        packed_outputs, preds = outputs
+        _, proto = packed_outputs
+        preds = self._augment_preds(x, preds, proto)
+        return packed_outputs, preds
+
+    def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Decode boxes/classes and append mask coefficients plus optional APD codes."""
+        preds = Detect._inference(self, x)
+        tail = [x["mask_coefficient"]]
+        if "apd_code" in x:
+            tail.append(x["apd_code"])
+        return torch.cat([preds, *tail], dim=1)
+
+    def postprocess(self, preds: torch.Tensor) -> torch.Tensor:
+        """Post-process predictions while preserving APD tail channels for NMS outputs."""
+        split_sizes = [4, self.nc, self.nm] + ([4] if self.enable_apd_prior else [])
+        parts = preds.split(split_sizes, dim=-1)
+        boxes, scores, mask_coefficient = parts[:3]
+        apd_code = parts[3] if self.enable_apd_prior else None
+        scores, conf, idx = self.get_topk_index(scores, self.max_det)
+        boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
+        mask_coefficient = mask_coefficient.gather(dim=1, index=idx.repeat(1, 1, self.nm))
+        merged = [boxes, scores, conf, mask_coefficient]
+        if apd_code is not None:
+            apd_code = apd_code.gather(dim=1, index=idx.repeat(1, 1, 4))
+            merged.append(apd_code)
+        return torch.cat(merged, dim=-1)
 
 
 class Segment26(Segment):
