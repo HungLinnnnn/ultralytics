@@ -1,0 +1,12 @@
+# Ultralytics AGPL-3.0 License - https://ultralytics.com/license
+
+# DSB2018 StarDist-prepared YOLO segmentation dataset.
+# Dataset root: /home/r13922151/cell_datasets/dataset/dsb2018/stardist_yolo
+
+path: /home/r13922151/cell_datasets/dataset/dsb2018/stardist_yolo
+train: train/images
+val: test/images
+test: test/images
+
+names:
+  0: cell
