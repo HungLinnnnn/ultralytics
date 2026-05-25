@@ -525,10 +525,10 @@ def pq_stats_from_labels(true: np.ndarray, pred: np.ndarray, match_iou: float = 
     if np.max(true) == 0 and np.max(pred) == 0:
         return 0, 0, 0, 0.0
     if np.max(true) == 0:
-        P = len(np.unique(pred)) - 1
+        P = len([idx for idx in np.unique(pred) if idx != 0])
         return 0, P, 0, 0.0
     if np.max(pred) == 0:
-        T = len(np.unique(true)) - 1
+        T = len([idx for idx in np.unique(true) if idx != 0])
         return 0, 0, T, 0.0
 
     # ---- 壓成連續 id（不修改原資料） ----
@@ -539,7 +539,7 @@ def pq_stats_from_labels(true: np.ndarray, pred: np.ndarray, match_iou: float = 
     # ---- 共現表（交集像素數）：O(HW) -> 一次 bincount 完成 ----
     # 把 (t,p) 對應到一維索引，再 bincount 計數後 reshape 回 (Tn, Pn)
     pair_1d = t_inv.astype(np.int64) * Pn + p_inv.astype(np.int64)
-    inter_mat = np.bincount(pair_1d, minlength=Tn * Pn).reshape(Tn, Pn).astype(np.float64)
+    inter_mat = np.bincount(pair_1d.ravel(), minlength=Tn * Pn).reshape(Tn, Pn).astype(np.float64)
 
     # ---- 背景列/行（label==0）索引 ----
     t_bg = int(np.where(t_ids == 0)[0][0]) if (t_ids[0] == 0 or 0 in t_ids) else None
