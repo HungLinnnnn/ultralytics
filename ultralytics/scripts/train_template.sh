@@ -45,7 +45,7 @@ DATA="${DATA:-ultralytics/cfg/datasets/dsb2018-stardist-yolo.yaml}"
 BATCH_SIZE="${BATCH_SIZE:-100}"
 EPOCHS="${EPOCHS:-600}"
 DEVICE="${DEVICE:-$GPU_ID}"
-PRETRAINED="${PRETRAINED:-yolov8n-seg.pt}"
+PRETRAINED="${PRETRAINED:-yolov8l-seg.pt}"
 PROJECT="${PROJECT:-DSB2018_stardist}"
 NAME="${NAME:-yolov8-seg-baseline}"
 
