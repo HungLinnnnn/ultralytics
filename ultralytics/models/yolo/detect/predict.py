@@ -51,25 +51,64 @@ class DetectionPredictor(BasePredictor):
             >>> processed_results = predictor.postprocess(preds, img, orig_imgs)
         """
         save_feats = getattr(self, "_feats", None) is not None
-        preds = nms.non_max_suppression(
+        h4_export = bool(getattr(self.args, "h4_export_internals", False)) and self.args.task == "segment"
+        h4_export_data = None
+        nc = 0 if self.args.task == "detect" else len(self.model.names)
+        if h4_export:
+            from ultralytics.utils.h4_export import build_pre_nms_candidate_tables
+
+            h4_export_data = {
+                "pre_nms_candidates": build_pre_nms_candidate_tables(
+                    preds,
+                    self.args.conf,
+                    self.args.classes,
+                    nc,
+                    getattr(self.args, "h4_export_max_pre_nms", 300),
+                    30000,
+                ),
+                "nms_config": {
+                    "conf": self.args.conf,
+                    "iou": self.args.iou,
+                    "classes": self.args.classes,
+                    "agnostic_nms": self.args.agnostic_nms,
+                    "class_aware_offsets": not self.args.agnostic_nms,
+                    "max_det": self.args.max_det,
+                    "max_nms": 30000,
+                    "nc": nc,
+                    "rotated": self.args.task == "obb",
+                    "end2end": getattr(self.model, "end2end", False),
+                    "max_pre_nms_candidates": getattr(self.args, "h4_export_max_pre_nms", 300),
+                },
+                "input_tensor_shape": list(img.shape),
+            }
+        nms_results = nms.non_max_suppression(
             preds,
             self.args.conf,
             self.args.iou,
             self.args.classes,
             self.args.agnostic_nms,
             max_det=self.args.max_det,
-            nc=0 if self.args.task == "detect" else len(self.model.names),
+            nc=nc,
             end2end=getattr(self.model, "end2end", False),
             rotated=self.args.task == "obb",
-            return_idxs=save_feats,
+            return_idxs=save_feats or h4_export,
         )
+
+        if save_feats or h4_export:
+            preds, kept_idxs = nms_results
+            if h4_export:
+                h4_export_data["kept_pre_nms_indices"] = kept_idxs
+        else:
+            preds = nms_results
 
         if not isinstance(orig_imgs, list):  # input images are a torch.Tensor, not a list
             orig_imgs = ops.convert_torch2numpy_batch(orig_imgs)[..., ::-1]
 
         if save_feats:
-            obj_feats = self.get_obj_feats(self._feats, preds[1])
-            preds = preds[0]
+            obj_feats = self.get_obj_feats(self._feats, kept_idxs)
+
+        if h4_export:
+            kwargs["h4_export"] = h4_export_data
 
         results = self.construct_results(preds, img, orig_imgs, **kwargs)
 
